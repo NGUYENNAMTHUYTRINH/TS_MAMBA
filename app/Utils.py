@@ -37,7 +37,7 @@ def format_time_utc_strings(values: pd.Series) -> pd.Series:
 
 def synthesize_tft_time_from_dataset(repo_root: Path, locations: pd.Series) -> pd.Series:
     """Tạo hourly UTC timestamps per location khi TFT output không có time column."""
-    dataset_path = repo_root / "dataset" / "2025.csv"
+    dataset_path = repo_root / "dataset" / "air_quality.csv"
     loc_series = locations.astype(str).reset_index(drop=True)
     out = pd.Series(index=loc_series.index, dtype="object")
 
@@ -46,14 +46,14 @@ def synthesize_tft_time_from_dataset(repo_root: Path, locations: pd.Series) -> p
 
     if dataset_path.exists():
         try:
-            src = pd.read_csv(dataset_path, usecols=["location_key", "ts_utc"])
-            src["ts_utc"] = pd.to_datetime(src["ts_utc"], utc=True, errors="coerce")
-            src = src.dropna(subset=["location_key", "ts_utc"]).copy()
+            src = pd.read_csv(dataset_path, usecols=["location_key", "Time"])
+            src["Time"] = pd.to_datetime(src["Time"], utc=True, errors="coerce")
+            src = src.dropna(subset=["location_key", "Time"]).copy()
             if not src.empty:
-                max_per_loc = src.groupby(src["location_key"].astype(str))["ts_utc"].max()
+                max_per_loc = src.groupby(src["location_key"].astype(str))["Time"].max()
                 for k, v in max_per_loc.items():
                     base_map[str(k)] = v + pd.Timedelta(hours=1)
-                global_base = src["ts_utc"].max() + pd.Timedelta(hours=1)
+                global_base = src["Time"].max() + pd.Timedelta(hours=1)
         except Exception:
             pass
 
@@ -118,44 +118,50 @@ def load_train_module():
 # ---------------------------------------------------------------------------
 
 def build_future_24h_frame(
-    df_valid: pd.DataFrame, feature_cols: list[str], target_col: str
+    df_valid: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    horizon: int = 24,
 ) -> pd.DataFrame:
-    """Tạo DataFrame dự báo 24h tiếp theo từ ngày cuối trong df_valid."""
-    if "ts_utc" not in df_valid.columns:
-        raise ValueError("Cần có cột 'ts_utc' để dự báo 24h tiếp theo.")
+    """Tạo DataFrame dự báo cho horizon giờ tiếp theo từ thời điểm sau cùng trong df_valid."""
+    if "Time" not in df_valid.columns:
+        raise ValueError("Cần có cột 'Time' để dự báo 24h tiếp theo.")
 
     work = df_valid.copy()
-    work["ts_utc"] = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
-    work = work.dropna(subset=["ts_utc"]).copy()
+    work["Time"] = pd.to_datetime(work["Time"], utc=True, errors="coerce")
+    work = work.dropna(subset=["Time"]).copy()
 
     future_rows = []
     if "location_key" in work.columns:
         groups = [
-            (loc, work.loc[work["location_key"].astype(str) == loc].sort_values("ts_utc").copy())
+            (loc, work.loc[work["location_key"].astype(str) == loc].sort_values("Time").copy())
             for loc in sorted(work["location_key"].dropna().astype(str).unique().tolist())
         ]
     else:
-        groups = [(None, work.sort_values("ts_utc").copy())]
+        groups = [(None, work.sort_values("Time").copy())]
 
     for loc, g in groups:
         if g.empty:
             continue
 
-        last_ts = g["ts_utc"].iloc[-1]
-        next_day_start = last_ts.normalize() + pd.Timedelta(days=1)
-        template = g.tail(24).copy()
-        if len(template) < 24:
+        last_ts = g["Time"].iloc[-1]
+        next_time_start = last_ts + pd.Timedelta(hours=1)
+        template = g.tail(horizon).copy()
+        if len(template) < horizon:
             template = pd.concat(
-                [template] * (24 // len(template) + 1), ignore_index=True
-            ).head(24)
+                [template] * (horizon // len(template) + 1), ignore_index=True
+            ).head(horizon)
 
-        for h in range(24):
+        for h in range(horizon):
             src = template.iloc[h].copy()
             row = {col: src[col] for col in feature_cols if col in template.columns}
             if loc is not None:
                 row["location_key"] = loc
-            row["ts_utc"] = next_day_start + pd.Timedelta(hours=h)
-            row[target_col] = np.nan
+            row["Time"] = next_time_start + pd.Timedelta(hours=h)
+            if target_col in feature_cols and target_col in template.columns:
+                row[target_col] = src[target_col]
+            else:
+                row[target_col] = np.nan
             future_rows.append(row)
 
     if not future_rows:

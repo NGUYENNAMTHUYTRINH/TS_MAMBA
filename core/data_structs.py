@@ -29,7 +29,7 @@ class SplitData:
     ----------
     x_seq   : (N, T, F) — chuỗi feature đầu vào
     loc_ids : (N,)      — id số nguyên của từng location
-    y       : (N,)      — giá trị target cần dự đoán
+    y       : (N, H)    — vector target nhiều bước (horizon)
     """
     x_seq:   np.ndarray
     loc_ids: np.ndarray

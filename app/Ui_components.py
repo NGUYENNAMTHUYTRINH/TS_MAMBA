@@ -77,7 +77,7 @@ def render_sidebar() -> tuple[str, str, object | None]:
         if not use_upload:
             data_path = st.text_input(
                 "Path CSV (tương đối hoặc tuyệt đối)",
-                value=st.session_state.get("_sidebar_path_input", "dataset/2025.csv"),
+                value=st.session_state.get("_sidebar_path_input", "dataset/air_quality.csv"),
                 help="Ví dụ: dataset/2025.csv  hoặc  D:/data/myfile.csv",
                 key="_sidebar_path_input",
             )
@@ -201,7 +201,7 @@ def render_location_selector(df: pd.DataFrame) -> list[str]:
         )
     with preview_col2:
         preview_horizon = st.number_input(
-            "Preview horizon", min_value=1, max_value=168, value=1, step=1
+            "Preview horizon", min_value=1, max_value=168, value=24, step=1
         )
 
     if selected_locations:
@@ -235,7 +235,10 @@ def _render_sample_count_preview(
             st.warning("Không thể load helper 'build_time_series_samples' để preview samples.")
             return
 
-        feature_cols = [c for c in df_sel.columns if c not in ["ts_utc", "location_key"]]
+        # Auto-detect timestamp column
+        ts_col = "ts_utc" if "ts_utc" in df_sel.columns else ("Time" if "Time" in df_sel.columns else None)
+        exclude_cols = [c for c in [ts_col, "location_key"] if c is not None]
+        feature_cols = [c for c in df_sel.columns if c not in exclude_cols]
         if default_target not in feature_cols:
             feature_cols.append(default_target)
 
@@ -273,7 +276,7 @@ def render_train_config() -> dict:
     feature_options = [
         c for c in all_cols
         if c not in reserved_cols
-        and c not in ["ts_utc", "location_key"]
+        and c not in (["ts_utc", "Time", "location_key"])
         and not c.lower().startswith("unnamed:")
     ]
 
@@ -286,11 +289,17 @@ def render_train_config() -> dict:
             options=feature_options,
             index=feature_options.index("aqi") if "aqi" in feature_options else 0,
         )
-        default_features = [c for c in feature_options if c != target_col]
+        default_features = [c for c in feature_options if c != target_col] + [target_col]
         feature_cols = st.multiselect(
             "Input feature columns",
-            options=[c for c in feature_options if c != target_col],
+            options=feature_options,
             default=default_features,
+        )
+        final_features = list(feature_cols)
+        if target_col not in final_features:
+            final_features.append(target_col)
+        st.caption(
+            "Input features (incl. target history): " + ", ".join(final_features)
         )
         loss_name = st.selectbox("Loss", options=["huber", "mse"], index=0)
 
