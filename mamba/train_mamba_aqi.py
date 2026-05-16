@@ -71,15 +71,18 @@ def build_time_series_samples(
     num_locations: int
     feature_cols : list[str] — tên các cột feature được dùng
     """
-    # Validate — auto-detect timestamp column: 'ts_utc' hoặc 'Time'
-    if "ts_utc" in df.columns:
-        ts_col = "ts_utc"
-    elif "Time" in df.columns:
-        ts_col = "Time"
+    # Validate — auto-detect timestamp column (case-insensitive)
+    col_map = {c.lower(): c for c in df.columns}
+    if "ts_utc" in col_map:
+        ts_col = col_map["ts_utc"]
+    elif "time" in col_map:
+        ts_col = col_map["time"]
+    elif "timestamp" in col_map:
+        ts_col = col_map["timestamp"]
     else:
         raise ValueError(
             "Cột timestamp không tìm thấy trong dataset. "
-            "Cần có cột 'ts_utc' hoặc 'Time'."
+            "Cần có cột 'ts_utc', 'Time', hoặc 'timestamp'."
         )
 
     for col, label in [(target_col, "target"), (ts_col, "timestamp"), ("location_key", "location")]:
@@ -455,7 +458,7 @@ def main() -> None:
     use_amp     = args.amp and device.type == "cuda"
     loader_kwargs = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=pin_memory)
 
-    train_loader = DataLoader(AQIDataset(train), shuffle=False, **loader_kwargs)
+    train_loader = DataLoader(AQIDataset(train), shuffle=True, **loader_kwargs)
     val_loader   = DataLoader(AQIDataset(val),   shuffle=False, **loader_kwargs)
     test_loader  = DataLoader(AQIDataset(test),  shuffle=False, **loader_kwargs)
 
@@ -465,6 +468,8 @@ def main() -> None:
         num_locations=num_locations,
         d_model=args.d_model,
         n_layers=args.n_layers,
+        horizon=args.horizon,
+        seq_len=args.window_size,
     ).to(device)
 
     criterion = nn.HuberLoss(delta=1.0) if args.loss == "huber" else nn.MSELoss()

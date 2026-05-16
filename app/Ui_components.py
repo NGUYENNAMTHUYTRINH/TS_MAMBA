@@ -75,9 +75,10 @@ def render_sidebar() -> tuple[str, str, object | None]:
         uploaded  = None
 
         if not use_upload:
+            default_path = "air_quality.csv" if (_PROJECT_ROOT / "air_quality.csv").exists() else "dataset/air_quality.csv"
             data_path = st.text_input(
                 "Path CSV (tương đối hoặc tuyệt đối)",
-                value=st.session_state.get("_sidebar_path_input", "dataset/air_quality.csv"),
+                value=st.session_state.get("_sidebar_path_input", default_path),
                 help="Ví dụ: dataset/2025.csv  hoặc  D:/data/myfile.csv",
                 key="_sidebar_path_input",
             )
@@ -194,15 +195,11 @@ def render_location_selector(df: pd.DataFrame) -> list[str]:
         help="Có thể chọn 1 hoặc nhiều địa điểm. Mô hình sẽ train chung theo nhiều tỉnh.",
     )
 
-    preview_col1, preview_col2 = st.columns(2)
-    with preview_col1:
-        preview_window = st.number_input(
-            "Preview window size (timesteps)", min_value=1, max_value=168, value=24, step=1
-        )
-    with preview_col2:
-        preview_horizon = st.number_input(
-            "Preview horizon", min_value=1, max_value=168, value=24, step=1
-        )
+    preview_window = int(st.session_state.get("train_window_size", 96))
+    preview_horizon = int(st.session_state.get("train_horizon", 24))
+    st.caption(
+        f"Preview window/horizon dùng từ cấu hình train: {preview_window} / {preview_horizon}"
+    )
 
     if selected_locations:
         _render_sample_count_preview(df, selected_locations, int(preview_window), int(preview_horizon))
@@ -235,8 +232,16 @@ def _render_sample_count_preview(
             st.warning("Không thể load helper 'build_time_series_samples' để preview samples.")
             return
 
-        # Auto-detect timestamp column
-        ts_col = "ts_utc" if "ts_utc" in df_sel.columns else ("Time" if "Time" in df_sel.columns else None)
+        # Auto-detect timestamp column (case-insensitive)
+        col_map = {c.lower(): c for c in df_sel.columns}
+        if "ts_utc" in col_map:
+            ts_col = col_map["ts_utc"]
+        elif "time" in col_map:
+            ts_col = col_map["time"]
+        elif "timestamp" in col_map:
+            ts_col = col_map["timestamp"]
+        else:
+            ts_col = None
         exclude_cols = [c for c in [ts_col, "location_key"] if c is not None]
         feature_cols = [c for c in df_sel.columns if c not in exclude_cols]
         if default_target not in feature_cols:
@@ -273,10 +278,11 @@ def render_train_config() -> dict:
     df = st.session_state.get("df", pd.DataFrame())
     all_cols = df.columns.tolist()
     reserved_cols = {"y_true", "y_pred", "abs_error"}
+    blocked_lower = {"ts_utc", "time", "timestamp", "location_key"}
     feature_options = [
         c for c in all_cols
         if c not in reserved_cols
-        and c not in (["ts_utc", "Time", "location_key"])
+        and c.lower() not in blocked_lower
         and not c.lower().startswith("unnamed:")
     ]
 
@@ -304,15 +310,38 @@ def render_train_config() -> dict:
         loss_name = st.selectbox("Loss", options=["huber", "mse"], index=0)
 
     with conf2:
-        epochs = st.number_input("Epochs", min_value=1, max_value=200, value=5, step=1)
-        batch_size = st.number_input("Batch size", min_value=8, max_value=8192, value=512, step=8)
-        lr = st.number_input("Learning rate", min_value=1e-6, max_value=1e-1, value=3e-4, format="%.6f")
+        window_size = st.number_input(
+            "Window size (timesteps)", min_value=1, max_value=168, value=96, step=1
+        )
+        horizon = st.number_input(
+            "Horizon (timesteps)", min_value=1, max_value=168, value=24, step=1
+        )
+        st.session_state["train_window_size"] = int(window_size)
+        st.session_state["train_horizon"] = int(horizon)
+        epochs = st.number_input("Epochs", min_value=1, max_value=200, value=50, step=1)
+        early_stop_patience = st.number_input(
+            "Early stop patience",
+            min_value=0,
+            max_value=50,
+            value=8,
+            step=1,
+        )
+        early_stop_min_delta = st.number_input(
+            "Early stop min delta",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.0,
+            step=0.001,
+            format="%.3f",
+        )
+        batch_size = st.number_input("Batch size", min_value=8, max_value=8192, value=32, step=8)
+        lr = st.number_input("Learning rate", min_value=1e-6, max_value=1e-1, value=5e-4, format="%.6f")
         weight_decay = st.number_input("Weight decay", min_value=0.0, max_value=1.0, value=1e-4, format="%.6f")
 
     with conf3:
-        d_model = st.number_input("d_model", min_value=16, max_value=512, value=64, step=16)
+        d_model = st.number_input("d_model", min_value=16, max_value=512, value=48, step=16)
         n_layers = st.number_input("n_layers", min_value=1, max_value=8, value=2, step=1)
-        grad_accum_steps = st.number_input("Gradient accumulation", min_value=1, max_value=64, value=2, step=1)
+        grad_accum_steps = st.number_input("Gradient accumulation", min_value=1, max_value=64, value=8, step=1)
         max_grad_norm = st.number_input("Max grad norm", min_value=0.0, max_value=100.0, value=1.0, step=0.5)
 
     run1, run2, run3 = st.columns(3)
@@ -334,6 +363,8 @@ def render_train_config() -> dict:
         target_col=target_col,
         feature_cols=feature_cols,
         loss_name=loss_name,
+        window_size=int(window_size),
+        horizon=int(horizon),
         epochs=int(epochs),
         batch_size=int(batch_size),
         lr=float(lr),
@@ -342,6 +373,8 @@ def render_train_config() -> dict:
         n_layers=int(n_layers),
         grad_accum_steps=int(grad_accum_steps),
         max_grad_norm=float(max_grad_norm),
+        early_stop_patience=int(early_stop_patience),
+        early_stop_min_delta=float(early_stop_min_delta),
         seed=int(seed),
         num_workers=int(num_workers),
         use_gpu=bool(use_gpu),

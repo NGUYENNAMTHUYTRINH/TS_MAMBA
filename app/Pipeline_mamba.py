@@ -85,6 +85,8 @@ def train_pipeline(
     selected_locations: list[str],
     target_col: str,
     feature_cols: list[str],
+    window_size: int,
+    horizon: int,
     epochs: int,
     batch_size: int,
     lr: float,
@@ -98,6 +100,8 @@ def train_pipeline(
     log_interval: int,
     grad_accum_steps: int,
     max_grad_norm: float,
+    early_stop_patience: int,
+    early_stop_min_delta: float,
     run_dir: str | None = None,
     forecast_file_name: str = "future_24h_predictions.csv",
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
@@ -126,8 +130,6 @@ def train_pipeline(
             "Không load được module mamba/scripts/train_mamba_aqi.py để chạy Mamba sequence."
         )
 
-    window_size = 24
-    horizon = 24
     x_seq, loc_ids, y, y_ts, num_locations, ts_feature_cols = mod.build_time_series_samples(
         df=work_df,
         target_col=target_col,
@@ -175,7 +177,7 @@ def train_pipeline(
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
 
-    train_loader = DataLoader(train_ds, shuffle=(device.type == "cuda"), **loader_kwargs)
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
 
@@ -193,6 +195,7 @@ def train_pipeline(
 
     best_val_loss = float("inf")
     best_state = None
+    no_improve = 0
     history: list[dict] = []
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
@@ -206,6 +209,7 @@ def train_pipeline(
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
+        running_samples = 0
         epoch_start = time.time()
         optimizer.zero_grad(set_to_none=True)
 
@@ -241,13 +245,14 @@ def train_pipeline(
                 optimizer.zero_grad(set_to_none=True)
 
             running_loss += loss.item() * yb.size(0)
+            running_samples += yb.size(0)
             global_step += 1
 
             if total_steps > 0 and (step % 20 == 0 or step == len(train_loader)):
                 prog.progress(min(global_step / total_steps, 1.0))
 
             if log_interval > 0 and (step % log_interval == 0 or step == len(train_loader)):
-                avg_loss = running_loss / max(step * yb.size(0), 1)
+                avg_loss = running_loss / max(running_samples, 1)
                 line = (
                     f"Epoch {epoch}/{epochs} | step {step}/{len(train_loader)} | "
                     f"batch_loss={loss.item():.6f} | running_avg={avg_loss:.6f}"
@@ -280,9 +285,18 @@ def train_pipeline(
             }
         )
 
-        if val_metrics["loss"] < best_val_loss:
+        if val_metrics["loss"] < (best_val_loss - early_stop_min_delta):
             best_val_loss = val_metrics["loss"]
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+            if early_stop_patience > 0 and no_improve >= early_stop_patience:
+                log_lines.append(
+                    f"Early stopping at epoch {epoch} (no improvement for {no_improve} epochs)."
+                )
+                log_box.code("\n".join(log_lines[-20:]))
+                break
 
     if best_state is None:
         raise RuntimeError("Không có checkpoint hợp lệ trong quá trình train.")

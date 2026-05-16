@@ -84,6 +84,8 @@ def main() -> None:
                 selected_locations=selected_locations,
                 target_col=train_cfg["target_col"],
                 feature_cols=feature_cols,
+                window_size=train_cfg["window_size"],
+                horizon=train_cfg["horizon"],
                 epochs=train_cfg["epochs"],
                 batch_size=train_cfg["batch_size"],
                 lr=train_cfg["lr"],
@@ -97,6 +99,8 @@ def main() -> None:
                 log_interval=50,
                 grad_accum_steps=train_cfg["grad_accum_steps"],
                 max_grad_norm=train_cfg["max_grad_norm"],
+                early_stop_patience=train_cfg["early_stop_patience"],
+                early_stop_min_delta=train_cfg["early_stop_min_delta"],
                 run_dir=mamba_run_dir,
             )
 
