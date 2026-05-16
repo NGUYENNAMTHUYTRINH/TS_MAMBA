@@ -48,8 +48,6 @@ class TimeSeriesMambaRegressor(nn.Module):
         d_model:  int = 64,
         n_layers: int = 2,
         loc_embed_dim: int = 8,
-        horizon: int = 1,
-        seq_len: int | None = None,
     ) -> None:
         super().__init__()
         self.location_emb = nn.Embedding(num_locations, loc_embed_dim)
@@ -59,21 +57,12 @@ class TimeSeriesMambaRegressor(nn.Module):
             for _ in range(n_layers)
         ])
         self.norm = nn.LayerNorm(d_model)
-        if seq_len is None:
-            self.head = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.GELU(),
-                nn.Linear(d_model, horizon),
-            )
-        else:
-            self.head = nn.Sequential(
-                nn.Linear(d_model * seq_len, d_model),
-                nn.GELU(),
-                nn.Linear(d_model, horizon),
-            )
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
         self.num_features = num_features
-        self.horizon = horizon
-        self.seq_len = seq_len
 
     def forward(self, x_seq: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -95,14 +84,7 @@ class TimeSeriesMambaRegressor(nn.Module):
             x = layer(x)
 
         x = self.norm(x)
-        if self.seq_len is None:
-            return self.head(x[:, -1, :])              # (B, horizon)
-        if x.size(1) != self.seq_len:
-            raise ValueError(
-                f"Expected seq_len={self.seq_len}, got T={x.size(1)}"
-            )
-        x_flat = x.reshape(x.size(0), -1)
-        return self.head(x_flat)                       # (B, horizon)
+        return self.head(x[:, -1, :]).squeeze(-1)              # lấy last timestep
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +110,6 @@ class TimeSeriesMambaRegressorNoLoc(nn.Module):
         num_features: int,
         d_model:  int = 64,
         n_layers: int = 2,
-        horizon: int = 1,
-        seq_len: int | None = None,
     ) -> None:
         super().__init__()
         self.feature_proj = nn.Linear(num_features, d_model)
@@ -138,20 +118,11 @@ class TimeSeriesMambaRegressorNoLoc(nn.Module):
             for _ in range(n_layers)
         ])
         self.norm = nn.LayerNorm(d_model)
-        if seq_len is None:
-            self.head = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.GELU(),
-                nn.Linear(d_model, horizon),
-            )
-        else:
-            self.head = nn.Sequential(
-                nn.Linear(d_model * seq_len, d_model),
-                nn.GELU(),
-                nn.Linear(d_model, horizon),
-            )
-        self.horizon = horizon
-        self.seq_len = seq_len
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
 
     def forward(self, x_seq: torch.Tensor, loc_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -168,11 +139,4 @@ class TimeSeriesMambaRegressorNoLoc(nn.Module):
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x)
-        if self.seq_len is None:
-            return self.head(x[:, -1, :])
-        if x.size(1) != self.seq_len:
-            raise ValueError(
-                f"Expected seq_len={self.seq_len}, got T={x.size(1)}"
-            )
-        x_flat = x.reshape(x.size(0), -1)
-        return self.head(x_flat)
+        return self.head(x[:, -1, :]).squeeze(-1)

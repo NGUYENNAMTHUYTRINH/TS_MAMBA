@@ -85,8 +85,6 @@ def train_pipeline(
     selected_locations: list[str],
     target_col: str,
     feature_cols: list[str],
-    window_size: int,
-    horizon: int,
     epochs: int,
     batch_size: int,
     lr: float,
@@ -100,8 +98,6 @@ def train_pipeline(
     log_interval: int,
     grad_accum_steps: int,
     max_grad_norm: float,
-    early_stop_patience: int,
-    early_stop_min_delta: float,
     run_dir: str | None = None,
     forecast_file_name: str = "future_24h_predictions.csv",
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
@@ -114,8 +110,8 @@ def train_pipeline(
         raise ValueError("Cần chọn ít nhất 1 location để train Mamba.")
 
     work_df = df.copy()
-    if "location_key" not in work_df.columns or "Time" not in work_df.columns:
-        raise ValueError("Dataset train Mamba cần có cột 'location_key' và 'Time'.")
+    if "location_key" not in work_df.columns or "ts_utc" not in work_df.columns:
+        raise ValueError("Dataset train Mamba cần có cột 'location_key' và 'ts_utc'.")
 
     work_df = work_df.loc[
         work_df["location_key"].astype(str).isin([str(x) for x in selected_locations])
@@ -130,6 +126,8 @@ def train_pipeline(
             "Không load được module mamba/scripts/train_mamba_aqi.py để chạy Mamba sequence."
         )
 
+    window_size = 24
+    horizon = 1
     x_seq, loc_ids, y, y_ts, num_locations, ts_feature_cols = mod.build_time_series_samples(
         df=work_df,
         target_col=target_col,
@@ -177,7 +175,7 @@ def train_pipeline(
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
 
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(train_ds, shuffle=(device.type == "cuda"), **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
 
@@ -186,8 +184,6 @@ def train_pipeline(
         num_locations=num_locations,
         d_model=d_model,
         n_layers=n_layers,
-        horizon=horizon,
-        seq_len=window_size,
     ).to(device)
 
     criterion = nn.HuberLoss(delta=1.0) if loss_name == "huber" else nn.MSELoss()
@@ -195,7 +191,6 @@ def train_pipeline(
 
     best_val_loss = float("inf")
     best_state = None
-    no_improve = 0
     history: list[dict] = []
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
@@ -209,7 +204,6 @@ def train_pipeline(
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
-        running_samples = 0
         epoch_start = time.time()
         optimizer.zero_grad(set_to_none=True)
 
@@ -245,14 +239,13 @@ def train_pipeline(
                 optimizer.zero_grad(set_to_none=True)
 
             running_loss += loss.item() * yb.size(0)
-            running_samples += yb.size(0)
             global_step += 1
 
             if total_steps > 0 and (step % 20 == 0 or step == len(train_loader)):
                 prog.progress(min(global_step / total_steps, 1.0))
 
             if log_interval > 0 and (step % log_interval == 0 or step == len(train_loader)):
-                avg_loss = running_loss / max(running_samples, 1)
+                avg_loss = running_loss / max(step * yb.size(0), 1)
                 line = (
                     f"Epoch {epoch}/{epochs} | step {step}/{len(train_loader)} | "
                     f"batch_loss={loss.item():.6f} | running_avg={avg_loss:.6f}"
@@ -285,18 +278,9 @@ def train_pipeline(
             }
         )
 
-        if val_metrics["loss"] < (best_val_loss - early_stop_min_delta):
+        if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            no_improve = 0
-        else:
-            no_improve += 1
-            if early_stop_patience > 0 and no_improve >= early_stop_patience:
-                log_lines.append(
-                    f"Early stopping at epoch {epoch} (no improvement for {no_improve} epochs)."
-                )
-                log_box.code("\n".join(log_lines[-20:]))
-                break
 
     if best_state is None:
         raise RuntimeError("Không có checkpoint hợp lệ trong quá trình train.")
@@ -310,7 +294,7 @@ def train_pipeline(
 
     # --- Build loc_to_id mapping ---
     cleaned = work_df.copy()
-    cleaned["_ts"] = pd.to_datetime(cleaned["Time"], utc=True, errors="coerce")
+    cleaned["_ts"] = pd.to_datetime(cleaned["ts_utc"], utc=True, errors="coerce")
     cleaned = cleaned.dropna(subset=["_ts", "location_key", target_col]).copy()
     cleaned["_loc_id"] = cleaned["location_key"].astype("category").cat.codes.astype(np.int64)
     loc_to_id = (
@@ -333,55 +317,20 @@ def train_pipeline(
 
     for col in ts_feature_cols:
         if col not in base_df.columns:
-            raise ValueError(f"Thiếu cột feature '{col}' trong dữ liệu forecast.")
+            base_df[col] = np.nan
         base_df[col] = pd.to_numeric(base_df[col], errors="coerce")
-    base_df[ts_feature_cols] = (
-        base_df.groupby("location_key", sort=False)[ts_feature_cols]
-        .ffill()
-        .bfill()
-    )
-    if base_df[ts_feature_cols].isna().any(axis=1).any():
-        nan_cols = base_df[ts_feature_cols].columns[
-            base_df[ts_feature_cols].isna().any()
-        ].tolist()
-        nan_locs = (
-            base_df.loc[base_df[ts_feature_cols].isna().any(axis=1), "location_key"]
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-        raise ValueError(
-            "Dữ liệu forecast vẫn còn NaN ở feature_cols sau khi ffill/bfill. "
-            f"cols={nan_cols}, locs={nan_locs[:5]}"
-        )
+        fill_val = base_df[col].median()
+        if pd.isna(fill_val):
+            fill_val = 0.0
+        base_df[col] = base_df[col].fillna(fill_val)
 
-    future_df = build_future_24h_frame(
-        base_df,
-        feature_cols=ts_feature_cols,
-        target_col=target_col,
-        horizon=horizon,
-    )
+    future_df = build_future_24h_frame(base_df, feature_cols=ts_feature_cols, target_col=target_col)
     for col in ts_feature_cols:
         future_df[col] = pd.to_numeric(future_df[col], errors="coerce")
-    future_df[ts_feature_cols] = (
-        future_df.groupby("location_key", sort=False)[ts_feature_cols]
-        .ffill()
-        .bfill()
-    )
-    if future_df[ts_feature_cols].isna().any(axis=1).any():
-        nan_cols = future_df[ts_feature_cols].columns[
-            future_df[ts_feature_cols].isna().any()
-        ].tolist()
-        nan_locs = (
-            future_df.loc[future_df[ts_feature_cols].isna().any(axis=1), "location_key"]
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-        raise ValueError(
-            "Future frame vẫn còn NaN ở feature_cols sau khi ffill/bfill. "
-            f"cols={nan_cols}, locs={nan_locs[:5]}"
-        )
+        fill_val = base_df[col].median() if col in base_df.columns else 0.0
+        if pd.isna(fill_val):
+            fill_val = 0.0
+        future_df[col] = future_df[col].fillna(fill_val)
 
     # --- Batched inference ---
     forecast_start = time.time()
@@ -398,9 +347,9 @@ def train_pipeline(
             loc_hist = (
                 base_df.loc[base_df["location_key"].astype(str) == loc]
                 .copy()
-                .assign(Time=lambda d: pd.to_datetime(d["Time"], utc=True, errors="coerce"))
-                .dropna(subset=["Time"])
-                .sort_values("Time")
+                .assign(ts_utc=lambda d: pd.to_datetime(d["ts_utc"], utc=True, errors="coerce"))
+                .dropna(subset=["ts_utc"])
+                .sort_values("ts_utc")
             )
             if len(loc_hist) < window_size:
                 continue
@@ -409,16 +358,17 @@ def train_pipeline(
             loc_future = (
                 future_df.loc[future_df["location_key"].astype(str) == loc]
                 .copy()
-                .assign(Time=lambda d: pd.to_datetime(d["Time"], utc=True, errors="coerce"))
-                .sort_values("Time")
+                .assign(ts_utc=lambda d: pd.to_datetime(d["ts_utc"], utc=True, errors="coerce"))
+                .sort_values("ts_utc")
             )
-            if loc_future.empty:
-                continue
 
-            x_norm = (rolling_window - x_mean_2d) / x_std_2d
-            infer_x.append(x_norm.astype(np.float32, copy=False))
-            infer_loc.append(int(loc_to_id[loc]))
-            infer_meta.append((loc_future["Time"].tolist(), loc))
+            for _, row in loc_future.iterrows():
+                x_norm = (rolling_window - x_mean_2d) / x_std_2d
+                infer_x.append(x_norm.astype(np.float32, copy=False))
+                infer_loc.append(int(loc_to_id[loc]))
+                infer_meta.append((row["ts_utc"], loc))
+                next_feats = row[ts_feature_cols].to_numpy(dtype=np.float32).reshape(1, -1)
+                rolling_window = np.concatenate([rolling_window[1:], next_feats], axis=0)
 
         if infer_x:
             x_all = torch.from_numpy(np.stack(infer_x, axis=0)).to(device, non_blocking=pin_memory)
@@ -427,12 +377,8 @@ def train_pipeline(
                 pred_norm_all = model(x_all, loc_all).detach().float().cpu().numpy()
 
             pred_all = pred_norm_all * y_std + y_mean
-            for (ts_list, loc_val), pred_vec in zip(infer_meta, pred_all):
-                steps = min(len(ts_list), pred_vec.shape[0])
-                for i in range(steps):
-                    preds_rows.append(
-                        {"time": ts_list[i], "location": loc_val, "predicted": float(pred_vec[i])}
-                    )
+            for (ts_val, loc_val), pred_val in zip(infer_meta, pred_all):
+                preds_rows.append({"time": ts_val, "location": loc_val, "predicted": float(pred_val)})
 
     forecast_sec = time.time() - forecast_start
 

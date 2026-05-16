@@ -12,7 +12,7 @@ Import từ mamba:
     mamba.mamba_model  → TimeSeriesMambaRegressor
 
 Chạy:
-    python mamba/train_mamba_aqi.py --data-path dataset/air_quality.csv --epochs 10
+    python mamba/train_mamba_aqi.py --data-path dataset/2025.csv --epochs 10
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def build_time_series_samples(
 
     Parameters
     ----------
-    df          : DataFrame gốc, cần có cột timestamp (ts_utc hoặc Time), location_key, target_col
+    df          : DataFrame gốc, cần có cột ts_utc, location_key, target_col
     target_col  : tên cột target cần dự đoán
     window_size : số timestep đầu vào (T)
     horizon     : dự đoán y(t + horizon)
@@ -66,26 +66,13 @@ def build_time_series_samples(
     -------
     x_seq        : (N, T, F) float32
     loc_ids      : (N,)      int64
-	y            : (N, H)    float32
+    y            : (N,)      float32
     y_ts         : (N,)      datetime64[ns]
     num_locations: int
     feature_cols : list[str] — tên các cột feature được dùng
     """
-    # Validate — auto-detect timestamp column (case-insensitive)
-    col_map = {c.lower(): c for c in df.columns}
-    if "ts_utc" in col_map:
-        ts_col = col_map["ts_utc"]
-    elif "time" in col_map:
-        ts_col = col_map["time"]
-    elif "timestamp" in col_map:
-        ts_col = col_map["timestamp"]
-    else:
-        raise ValueError(
-            "Cột timestamp không tìm thấy trong dataset. "
-            "Cần có cột 'ts_utc', 'Time', hoặc 'timestamp'."
-        )
-
-    for col, label in [(target_col, "target"), (ts_col, "timestamp"), ("location_key", "location")]:
+    # Validate
+    for col, label in [(target_col, "target"), ("ts_utc", "timestamp"), ("location_key", "location")]:
         if col not in df.columns:
             raise ValueError(f"Cột {label} '{col}' không tìm thấy trong dataset.")
     if window_size < 1:
@@ -94,10 +81,10 @@ def build_time_series_samples(
         raise ValueError("horizon phải >= 1.")
 
     work = df.copy()
-    work["_ts"] = pd.to_datetime(work[ts_col], utc=True, errors="coerce")
+    work["_ts"] = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
     missing_required = work[["_ts", "location_key", target_col]].isna().any(axis=1)
     if missing_required.any():
-        raise ValueError(f"Dữ liệu chứa NaN ở {ts_col}/location_key/target. Vui lòng làm sạch trước.")
+        raise ValueError("Dữ liệu chứa NaN ở ts_utc/location_key/target. Vui lòng làm sạch trước.")
 
     work["_loc_id"] = work["location_key"].astype("category").cat.codes.astype(np.int64)
     num_locations   = int(work["_loc_id"].max()) + 1
@@ -120,18 +107,11 @@ def build_time_series_samples(
     if not numeric_cols:
         raise ValueError("Không tìm thấy cột feature numeric nào sau khi lọc.")
 
-    # Ép numeric, forward-fill theo location; đánh dấu row impute để bỏ khỏi train
-    cols_to_fill = list(dict.fromkeys(numeric_cols + [target_col]))
-    for col in cols_to_fill:
+    # Ép numeric và kiểm tra NaN
+    for col in numeric_cols:
         work[col] = pd.to_numeric(work[col], errors="coerce")
-
-    missing_mask = work[cols_to_fill].isna().any(axis=1)
-    work[cols_to_fill] = (
-        work.groupby("_loc_id", sort=False)[cols_to_fill]
-        .ffill()
-    )
-    still_missing = work[cols_to_fill].isna().any(axis=1)
-    work["_invalid"] = missing_mask | still_missing
+    if work[numeric_cols].isna().any(axis=1).any():
+        raise ValueError("Dữ liệu chứa NaN ở feature_cols. Vui lòng làm sạch trước.")
 
     work = work.sort_values(["_loc_id", "_ts"]).reset_index(drop=True)
 
@@ -141,26 +121,18 @@ def build_time_series_samples(
         x_vals  = group[numeric_cols].to_numpy(dtype=np.float32)
         y_vals  = group[target_col].to_numpy(dtype=np.float32)
         ts_vals = group["_ts"].to_numpy(dtype="datetime64[ns]")
-        invalid = group["_invalid"].to_numpy(dtype=np.int64)
         n = len(group)
 
         max_start = n - window_size - horizon + 1
         if max_start <= 0:
             continue
 
-        invalid_prefix = np.concatenate([[0], np.cumsum(invalid)])
-
         for start in range(max_start):
             end        = start + window_size
-            target_end = end + horizon
-            target_idx = target_end - 1
-            if invalid_prefix[end] - invalid_prefix[start] > 0:
-                continue
-            if invalid_prefix[target_end] - invalid_prefix[end] > 0:
-                continue
+            target_idx = end + horizon - 1
             x_seq_list.append(x_vals[start:end])
             loc_id_list.append(loc_id)
-            y_list.append(y_vals[end:target_end])
+            y_list.append(y_vals[target_idx])
             y_ts_list.append(ts_vals[target_idx])
 
     if not x_seq_list:
@@ -172,7 +144,7 @@ def build_time_series_samples(
     return (
         np.stack(x_seq_list).astype(np.float32),
         np.asarray(loc_id_list, dtype=np.int64),
-        np.stack(y_list).astype(np.float32),
+        np.asarray(y_list, dtype=np.float32),
         np.asarray(y_ts_list, dtype="datetime64[ns]"),
         num_locations,
         numeric_cols,
@@ -379,7 +351,7 @@ def evaluate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Mamba AQI forecasting model")
-    parser.add_argument("--data-path",        type=str,   default="dataset/air_quality.csv")
+    parser.add_argument("--data-path",        type=str,   default="dataset/2025.csv")
     parser.add_argument("--target-col",       type=str,   default="aqi")
     parser.add_argument("--window-size",      type=int,   default=24)
     parser.add_argument("--horizon",          type=int,   default=1)
@@ -458,7 +430,7 @@ def main() -> None:
     use_amp     = args.amp and device.type == "cuda"
     loader_kwargs = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=pin_memory)
 
-    train_loader = DataLoader(AQIDataset(train), shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(AQIDataset(train), shuffle=False, **loader_kwargs)
     val_loader   = DataLoader(AQIDataset(val),   shuffle=False, **loader_kwargs)
     test_loader  = DataLoader(AQIDataset(test),  shuffle=False, **loader_kwargs)
 
@@ -468,8 +440,6 @@ def main() -> None:
         num_locations=num_locations,
         d_model=args.d_model,
         n_layers=args.n_layers,
-        horizon=args.horizon,
-        seq_len=args.window_size,
     ).to(device)
 
     criterion = nn.HuberLoss(delta=1.0) if args.loss == "huber" else nn.MSELoss()
