@@ -1,0 +1,39 @@
+Collecting causal-conv1d
+  Using cached causal_conv1d-1.6.2.post1.tar.gz (29 kB)
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: torch in /home/tnnt/mamba_env/lib/python3.10/site-packages (from causal-conv1d) (2.7.1+cu118)
+Requirement already satisfied: packaging in /home/tnnt/mamba_env/lib/python3.10/site-packages (from causal-conv1d) (26.2)
+Collecting ninja (from causal-conv1d)
+  Downloading ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (5.1 kB)
+Requirement already satisfied: filelock in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (3.29.0)
+Requirement already satisfied: typing-extensions>=4.10.0 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (4.15.0)
+Requirement already satisfied: sympy>=1.13.3 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (1.14.0)
+Requirement already satisfied: networkx in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (3.4.2)
+Requirement already satisfied: jinja2 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (3.1.6)
+Requirement already satisfied: fsspec in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (2026.4.0)
+Requirement already satisfied: nvidia-cuda-nvrtc-cu11==11.8.89 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (11.8.89)
+Requirement already satisfied: nvidia-cuda-runtime-cu11==11.8.89 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (11.8.89)
+Requirement already satisfied: nvidia-cuda-cupti-cu11==11.8.87 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (11.8.87)
+Requirement already satisfied: nvidia-cudnn-cu11==9.1.0.70 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (9.1.0.70)
+Requirement already satisfied: nvidia-cublas-cu11==11.11.3.6 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (11.11.3.6)
+Requirement already satisfied: nvidia-cufft-cu11==10.9.0.58 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (10.9.0.58)
+Requirement already satisfied: nvidia-curand-cu11==10.3.0.86 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (10.3.0.86)
+Requirement already satisfied: nvidia-cusolver-cu11==11.4.1.48 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (11.4.1.48)
+Requirement already satisfied: nvidia-cusparse-cu11==11.7.5.86 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (11.7.5.86)
+Requirement already satisfied: nvidia-nccl-cu11==2.21.5 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (2.21.5)
+Requirement already satisfied: nvidia-nvtx-cu11==11.8.86 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (11.8.86)
+Requirement already satisfied: triton==3.3.1 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from torch->causal-conv1d) (3.3.1)
+Requirement already satisfied: setuptools>=40.8.0 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from triton==3.3.1->torch->causal-conv1d) (82.0.1)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from sympy>=1.13.3->torch->causal-conv1d) (1.3.0)
+Requirement already satisfied: MarkupSafe>=2.0 in /home/tnnt/mamba_env/lib/python3.10/site-packages (from jinja2->torch->causal-conv1d) (3.0.3)
+Downloading ninja-1.13.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (180 kB)
+Building wheels for collected packages: causal-conv1d
+  Building wheel for causal-conv1d (pyproject.toml): started
+  Building wheel for causal-conv1d (pyproject.toml): finished with status 'done'
+  Created wheel for causal-conv1d: filename=causal_conv1d-1.6.2.post1-cp310-cp310-linux_x86_64.whl size=109223767 sha256=029e5722be95d2b8eacfb41d1e6395063e67b24f07c33d344d55d588fe668fb6
+  Stored in directory: /home/tnnt/.cache/pip/wheels/25/02/17/a2e2d2abc282203cdb268407f53a63e155c12e2e2f1827b1ec
+Successfully built causal-conv1d
+Installing collected packages: ninja, causal-conv1d
+
+Successfully installed causal-conv1d-1.6.2.post1 ninja-1.13.0

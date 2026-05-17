@@ -121,6 +121,15 @@ def build_future_24h_frame(
     df_valid: pd.DataFrame, feature_cols: list[str], target_col: str
 ) -> pd.DataFrame:
     """Tạo DataFrame dự báo 24h tiếp theo từ ngày cuối trong df_valid."""
+    normalized = df_valid.copy()
+    col_map = {c.lower(): c for c in normalized.columns}
+    ts_col = col_map.get("ts_utc") or col_map.get("time") or col_map.get("timestamp")
+    if ts_col is None:
+        raise ValueError("Cần có cột timestamp ('ts_utc', 'Time', hoặc 'timestamp') để dự báo 24h tiếp theo.")
+    if ts_col != "ts_utc":
+        normalized["ts_utc"] = normalized[ts_col]
+    df_valid = normalized
+
     if "ts_utc" not in df_valid.columns:
         raise ValueError("Cần có cột 'ts_utc' để dự báo 24h tiếp theo.")
 

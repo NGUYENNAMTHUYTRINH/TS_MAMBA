@@ -77,7 +77,7 @@ def render_sidebar() -> tuple[str, str, object | None]:
         if not use_upload:
             data_path = st.text_input(
                 "Path CSV (tương đối hoặc tuyệt đối)",
-                value=st.session_state.get("_sidebar_path_input", "dataset/2025.csv"),
+                value=st.session_state.get("_sidebar_path_input", str(_PROJECT_ROOT / "dataset" / "air_quality.csv")),
                 help="Ví dụ: dataset/2025.csv  hoặc  D:/data/myfile.csv",
                 key="_sidebar_path_input",
             )
@@ -194,24 +194,20 @@ def render_location_selector(df: pd.DataFrame) -> list[str]:
         help="Có thể chọn 1 hoặc nhiều địa điểm. Mô hình sẽ train chung theo nhiều tỉnh.",
     )
 
-    preview_col1, preview_col2 = st.columns(2)
-    with preview_col1:
-        preview_window = st.number_input(
-            "Preview window size (timesteps)", min_value=1, max_value=168, value=24, step=1
-        )
-    with preview_col2:
-        preview_horizon = st.number_input(
-            "Preview horizon", min_value=1, max_value=168, value=1, step=1
-        )
+    preview_window = int(st.session_state.get("train_window_size", 96))
+    preview_horizon = int(st.session_state.get("train_horizon", 24))
+    preview_stride = int(st.session_state.get("train_sample_stride", 1))
 
     if selected_locations:
-        _render_sample_count_preview(df, selected_locations, int(preview_window), int(preview_horizon))
+        _render_sample_count_preview(
+            df, selected_locations, int(preview_window), int(preview_horizon), int(preview_stride)
+        )
 
     return selected_locations
 
 
 def _render_sample_count_preview(
-    df: pd.DataFrame, selected_locations: list[str], window: int, horizon: int
+    df: pd.DataFrame, selected_locations: list[str], window: int, horizon: int, sample_stride: int
 ) -> None:
     """Hiển thị số lượng sample train/val/test theo preview window/horizon."""
     try:
@@ -235,7 +231,10 @@ def _render_sample_count_preview(
             st.warning("Không thể load helper 'build_time_series_samples' để preview samples.")
             return
 
-        feature_cols = [c for c in df_sel.columns if c not in ["ts_utc", "location_key"]]
+        col_map = {c.lower(): c for c in df_sel.columns}
+        ts_col = col_map.get("ts_utc") or col_map.get("time") or col_map.get("timestamp")
+        exclude_cols = [c for c in [ts_col, col_map.get("location_key") or "location_key"] if c]
+        feature_cols = [c for c in df_sel.columns if c not in exclude_cols]
         if default_target not in feature_cols:
             feature_cols.append(default_target)
 
@@ -244,6 +243,7 @@ def _render_sample_count_preview(
             default_target,
             window,
             horizon,
+            sample_stride=sample_stride,
             feature_cols=feature_cols,
             include_target_history=True,
         )
@@ -254,7 +254,7 @@ def _render_sample_count_preview(
 
         st.markdown(
             f"**Preview ({len(selected_locations)} locations)**: "
-            f"total samples={len(y):,}"
+            f"total samples={len(y):,} | sliding step={sample_stride}"
         )
         st.write(f"Train: {len(train.y):,}  |  Val: {len(val.y):,}  |  Test: {len(test.y):,}")
     except Exception as e:
@@ -270,10 +270,11 @@ def render_train_config() -> dict:
     df = st.session_state.get("df", pd.DataFrame())
     all_cols = df.columns.tolist()
     reserved_cols = {"y_true", "y_pred", "abs_error"}
+    blocked_lower = {"ts_utc", "time", "timestamp", "location_key"}
     feature_options = [
         c for c in all_cols
         if c not in reserved_cols
-        and c not in ["ts_utc", "location_key"]
+        and c.lower() not in blocked_lower
         and not c.lower().startswith("unnamed:")
     ]
 
@@ -286,31 +287,40 @@ def render_train_config() -> dict:
             options=feature_options,
             index=feature_options.index("aqi") if "aqi" in feature_options else 0,
         )
-        default_features = [c for c in feature_options if c != target_col]
+        default_features = list(feature_options)
         feature_cols = st.multiselect(
             "Input feature columns",
-            options=[c for c in feature_options if c != target_col],
+            options=feature_options,
             default=default_features,
         )
         loss_name = st.selectbox("Loss", options=["huber", "mse"], index=0)
 
     with conf2:
-        epochs = st.number_input("Epochs", min_value=1, max_value=200, value=5, step=1)
-        batch_size = st.number_input("Batch size", min_value=8, max_value=8192, value=512, step=8)
+        window_size = st.number_input("Window size (timesteps)", min_value=1, max_value=168, value=96, step=1)
+        horizon = st.number_input("Horizon (timesteps)", min_value=1, max_value=168, value=24, step=1)
+        sample_stride = st.number_input("Sliding step", min_value=1, max_value=168, value=1, step=1)
+        st.session_state["train_window_size"] = int(window_size)
+        st.session_state["train_horizon"] = int(horizon)
+        st.session_state["train_sample_stride"] = int(sample_stride)
+        epochs = st.number_input("Epochs", min_value=1, max_value=200, value=50, step=1)
+        early_stop_patience = st.number_input(
+            "Early stop patience", min_value=0, max_value=50, value=5, step=1
+        )
+        batch_size = st.number_input("Batch size", min_value=8, max_value=8192, value=128, step=8)
         lr = st.number_input("Learning rate", min_value=1e-6, max_value=1e-1, value=3e-4, format="%.6f")
         weight_decay = st.number_input("Weight decay", min_value=0.0, max_value=1.0, value=1e-4, format="%.6f")
 
     with conf3:
         d_model = st.number_input("d_model", min_value=16, max_value=512, value=64, step=16)
         n_layers = st.number_input("n_layers", min_value=1, max_value=8, value=2, step=1)
-        grad_accum_steps = st.number_input("Gradient accumulation", min_value=1, max_value=64, value=2, step=1)
+        grad_accum_steps = st.number_input("Gradient accumulation", min_value=1, max_value=64, value=1, step=1)
         max_grad_norm = st.number_input("Max grad norm", min_value=0.0, max_value=100.0, value=1.0, step=0.5)
 
     run1, run2, run3 = st.columns(3)
     with run1:
         seed = st.number_input("Seed", min_value=0, max_value=999999, value=42, step=1)
     with run2:
-        num_workers = st.number_input("DataLoader workers", min_value=0, max_value=16, value=0, step=1)
+        st.markdown(" ")
     with run3:
         use_gpu = st.checkbox("Dùng GPU (nếu có)", value=True)
 
@@ -325,7 +335,11 @@ def render_train_config() -> dict:
         target_col=target_col,
         feature_cols=feature_cols,
         loss_name=loss_name,
+        window_size=int(window_size),
+        horizon=int(horizon),
+        sample_stride=int(sample_stride),
         epochs=int(epochs),
+        early_stop_patience=int(early_stop_patience),
         batch_size=int(batch_size),
         lr=float(lr),
         weight_decay=float(weight_decay),
@@ -334,7 +348,6 @@ def render_train_config() -> dict:
         grad_accum_steps=int(grad_accum_steps),
         max_grad_norm=float(max_grad_norm),
         seed=int(seed),
-        num_workers=int(num_workers),
         use_gpu=bool(use_gpu),
     )
 

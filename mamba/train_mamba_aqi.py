@@ -52,12 +52,13 @@ def build_time_series_samples(
     horizon: int,
     feature_cols: list[str] | None = None,
     include_target_history: bool = True,
+    sample_stride: int = 1,
 ):
     """Tạo sliding-window samples từ DataFrame time-series nhiều location.
 
     Parameters
     ----------
-    df          : DataFrame gốc, cần có cột ts_utc, location_key, target_col
+    df          : DataFrame gốc, cần có cột timestamp (ts_utc hoặc Time), location_key, target_col
     target_col  : tên cột target cần dự đoán
     window_size : số timestep đầu vào (T)
     horizon     : dự đoán y(t + horizon)
@@ -66,13 +67,25 @@ def build_time_series_samples(
     -------
     x_seq        : (N, T, F) float32
     loc_ids      : (N,)      int64
-    y            : (N,)      float32
+    y            : (N, H)    float32
     y_ts         : (N,)      datetime64[ns]
     num_locations: int
     feature_cols : list[str] — tên các cột feature được dùng
     """
-    # Validate
-    for col, label in [(target_col, "target"), ("ts_utc", "timestamp"), ("location_key", "location")]:
+    # Validate — auto-detect timestamp column (case-insensitive)
+    col_map = {c.lower(): c for c in df.columns}
+    if "ts_utc" in col_map:
+        ts_col = col_map["ts_utc"]
+    elif "time" in col_map:
+        ts_col = col_map["time"]
+    elif "timestamp" in col_map:
+        ts_col = col_map["timestamp"]
+    else:
+        raise ValueError(
+            "Cột timestamp không tìm thấy trong dataset. "
+            "Cần có cột 'ts_utc', 'Time', hoặc 'timestamp'."
+        )
+    for col, label in [(target_col, "target"), (ts_col, "timestamp"), ("location_key", "location")]:
         if col not in df.columns:
             raise ValueError(f"Cột {label} '{col}' không tìm thấy trong dataset.")
     if window_size < 1:
@@ -80,11 +93,14 @@ def build_time_series_samples(
     if horizon < 1:
         raise ValueError("horizon phải >= 1.")
 
+    if sample_stride < 1:
+        raise ValueError("sample_stride phải >= 1.")
+
     work = df.copy()
-    work["_ts"] = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
+    work["_ts"] = pd.to_datetime(work[ts_col], utc=True, errors="coerce")
     missing_required = work[["_ts", "location_key", target_col]].isna().any(axis=1)
     if missing_required.any():
-        raise ValueError("Dữ liệu chứa NaN ở ts_utc/location_key/target. Vui lòng làm sạch trước.")
+        raise ValueError(f"Dữ liệu chứa NaN ở {ts_col}/location_key/target. Vui lòng làm sạch trước.")
 
     work["_loc_id"] = work["location_key"].astype("category").cat.codes.astype(np.int64)
     num_locations   = int(work["_loc_id"].max()) + 1
@@ -107,33 +123,68 @@ def build_time_series_samples(
     if not numeric_cols:
         raise ValueError("Không tìm thấy cột feature numeric nào sau khi lọc.")
 
-    # Ép numeric và kiểm tra NaN
-    for col in numeric_cols:
+    # Ép numeric, forward-fill theo location; đánh dấu row impute để bỏ khỏi train
+    cols_to_fill = list(dict.fromkeys(numeric_cols + [target_col]))
+    for col in cols_to_fill:
         work[col] = pd.to_numeric(work[col], errors="coerce")
-    if work[numeric_cols].isna().any(axis=1).any():
-        raise ValueError("Dữ liệu chứa NaN ở feature_cols. Vui lòng làm sạch trước.")
+
+    all_nan_cols = [c for c in cols_to_fill if work[c].isna().all()]
+    if target_col in all_nan_cols:
+        raise ValueError("Target cột toàn NaN, không thể tạo sample.")
+    if all_nan_cols:
+        numeric_cols = [c for c in numeric_cols if c not in all_nan_cols]
+        cols_to_fill = [c for c in cols_to_fill if c not in all_nan_cols]
+
+    missing_mask = work[cols_to_fill].isna().any(axis=1)
+    work[cols_to_fill] = (
+        work.groupby("_loc_id", sort=False)[cols_to_fill]
+        .ffill()
+    )
+    still_missing = work[cols_to_fill].isna().any(axis=1)
+    work["_invalid"] = missing_mask | still_missing
 
     work = work.sort_values(["_loc_id", "_ts"]).reset_index(drop=True)
 
     x_seq_list, loc_id_list, y_list, y_ts_list = [], [], [], []
 
     for loc_id, group in work.groupby("_loc_id", sort=False):
-        x_vals  = group[numeric_cols].to_numpy(dtype=np.float32)
-        y_vals  = group[target_col].to_numpy(dtype=np.float32)
+        x_vals = group[numeric_cols].to_numpy(dtype=np.float32)
+        y_vals = group[target_col].to_numpy(dtype=np.float32)
         ts_vals = group["_ts"].to_numpy(dtype="datetime64[ns]")
+        invalid = group["_invalid"].to_numpy(dtype=np.int64)
         n = len(group)
 
         max_start = n - window_size - horizon + 1
         if max_start <= 0:
             continue
 
-        for start in range(max_start):
-            end        = start + window_size
-            target_idx = end + horizon - 1
-            x_seq_list.append(x_vals[start:end])
-            loc_id_list.append(loc_id)
-            y_list.append(y_vals[target_idx])
-            y_ts_list.append(ts_vals[target_idx])
+        invalid_prefix = np.concatenate([[0], np.cumsum(invalid)])
+        starts = np.arange(0, max_start, sample_stride, dtype=np.int64)
+        ends = starts + window_size
+        target_ends = ends + horizon
+
+        valid_x = (invalid_prefix[ends] - invalid_prefix[starts]) == 0
+        valid_y = (invalid_prefix[target_ends] - invalid_prefix[ends]) == 0
+        valid = valid_x & valid_y
+        if not np.any(valid):
+            continue
+
+        row_s, feat_s = x_vals.strides
+        x_all = np.lib.stride_tricks.as_strided(
+            x_vals,
+            shape=(len(starts), window_size, x_vals.shape[1]),
+            strides=(sample_stride * row_s, row_s, feat_s),
+        )
+
+        valid_starts = starts[valid]
+        valid_ends = ends[valid]
+        valid_target_ends = target_ends[valid]
+        y_idx = valid_ends[:, None] + np.arange(horizon, dtype=np.int64)[None, :]
+
+        x_seq_list.append(x_all[valid].copy())
+        loc_id_list.append(np.full(len(valid_starts), loc_id, dtype=np.int64))
+        y_list.append(y_vals[y_idx].astype(np.float32, copy=False))
+        y_ts_list.append(ts_vals[valid_target_ends - 1])
 
     if not x_seq_list:
         raise ValueError(
@@ -142,10 +193,10 @@ def build_time_series_samples(
         )
 
     return (
-        np.stack(x_seq_list).astype(np.float32),
-        np.asarray(loc_id_list, dtype=np.int64),
-        np.asarray(y_list, dtype=np.float32),
-        np.asarray(y_ts_list, dtype="datetime64[ns]"),
+        np.concatenate(x_seq_list, axis=0).astype(np.float32),
+        np.concatenate(loc_id_list, axis=0).astype(np.int64),
+        np.concatenate(y_list, axis=0).astype(np.float32),
+        np.concatenate(y_ts_list, axis=0).astype("datetime64[ns]"),
         num_locations,
         numeric_cols,
     )
@@ -355,6 +406,7 @@ def main() -> None:
     parser.add_argument("--target-col",       type=str,   default="aqi")
     parser.add_argument("--window-size",      type=int,   default=24)
     parser.add_argument("--horizon",          type=int,   default=1)
+    parser.add_argument("--sample-stride",    type=int,   default=4)
     parser.add_argument("--epochs",           type=int,   default=2)
     parser.add_argument("--batch-size",       type=int,   default=512)
     parser.add_argument("--lr",               type=float, default=1e-3)
@@ -372,6 +424,8 @@ def main() -> None:
     parser.add_argument("--amp",              action="store_true")
     parser.add_argument("--grad-accum-steps", type=int,   default=1)
     parser.add_argument("--max-grad-norm",    type=float, default=1.0)
+    parser.add_argument("--patience",         type=int,   default=5)
+    parser.add_argument("--min-delta",        type=float, default=0.0)
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -411,10 +465,11 @@ def main() -> None:
 
     # Build samples
     x_seq, loc_ids, y, y_ts, num_locations, feature_cols = build_time_series_samples(
-        df, args.target_col, args.window_size, args.horizon
+        df, args.target_col, args.window_size, args.horizon,
+        sample_stride=args.sample_stride,
     )
     logger.info("Features (%d): %s", len(feature_cols), feature_cols)
-    logger.info("Samples: %d | Locations: %d", len(y), num_locations)
+    logger.info("Samples: %d | Locations: %d | Sample stride: %d", len(y), num_locations, args.sample_stride)
 
     # Split + Normalize
     train, val, test = split_data_by_timeline(x_seq, loc_ids, y, y_ts)
@@ -440,6 +495,7 @@ def main() -> None:
         num_locations=num_locations,
         d_model=args.d_model,
         n_layers=args.n_layers,
+        horizon=args.horizon,
     ).to(device)
 
     criterion = nn.HuberLoss(delta=1.0) if args.loss == "huber" else nn.MSELoss()
@@ -453,6 +509,7 @@ def main() -> None:
     best_val_loss  = float("inf")
     best_path      = os.path.join(args.out_dir, "best_mamba_aqi.pt")
     history_path   = os.path.join(args.out_dir, "metrics_history.csv")
+    epochs_without_improvement = 0
 
     with open(history_path, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(
@@ -488,18 +545,35 @@ def main() -> None:
                 f"{train_sec:.2f}",
             ])
 
-        if val_metrics["loss"] < best_val_loss:
+        if val_metrics["loss"] < best_val_loss - args.min_delta:
             best_val_loss = val_metrics["loss"]
             torch.save(model.state_dict(), best_path)
+            epochs_without_improvement = 0
             logger.info("→ Checkpoint mới: %s", best_path)
+
+        else:
+            epochs_without_improvement += 1
+
+        if args.patience > 0 and epochs_without_improvement >= args.patience:
+            logger.info(
+                "Early stopping at epoch %d/%d | best_val_loss=%.6f",
+                epoch, args.epochs, best_val_loss,
+            )
+            break
 
     # Test
     model.load_state_dict(torch.load(best_path, map_location=device))
     test_metrics = evaluate(model, test_loader, criterion, device, use_amp, y_mean, y_std)
 
-    logger.info("TEST | loss=%.6f | mae=%.4f | rmse=%.4f | r2=%.4f",
-                test_metrics["loss"], test_metrics["mae"],
-                test_metrics["rmse"], test_metrics["r2"])
+    logger.info(
+        "TEST | loss=%.6f | mae=%.4f | rmse=%.4f | r2=%.4f | mae_norm=%.4f | rmse_norm=%.4f",
+        test_metrics["loss"],
+        test_metrics["mae"],
+        test_metrics["rmse"],
+        test_metrics["r2"],
+        test_metrics.get("mae_norm", float("nan")),
+        test_metrics.get("rmse_norm", float("nan")),
+    )
     logger.info("Best model: %s", best_path)
     logger.info("History   : %s", history_path)
 

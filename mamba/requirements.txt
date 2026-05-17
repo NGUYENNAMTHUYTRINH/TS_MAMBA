@@ -1,17 +1,17 @@
 # Environment notes (from current machine)
 # Python: 3.11.9
-# NVIDIA Driver: 512.74
-# CUDA Driver Runtime (nvidia-smi): 11.6
-# PyTorch build: 2.7.1+cu118 (CUDA 11.8)
+# NVIDIA Driver: >=570.65 required for CUDA 12.8 runtime
+# CUDA Driver Runtime (nvidia-smi): >=12.8 after driver update
+# PyTorch build: 2.7.1+cu128 (CUDA 12.8)
 # torch.cuda.is_available(): True
 # GPU: NVIDIA GeForce RTX 3050 Laptop GPU
 
-# Use the PyTorch cu118 wheel index for +cu118 builds
---extra-index-url https://download.pytorch.org/whl/cu118
+# Use the PyTorch cu128 wheel index for +cu128 builds
+--extra-index-url https://download.pytorch.org/whl/cu128
 
-torch==2.7.1+cu118
-torchvision==0.22.1+cu118
-torchaudio==2.7.1+cu118
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchaudio==2.7.1+cu128
 
 einops==0.8.2
 transformers>=4.40.0

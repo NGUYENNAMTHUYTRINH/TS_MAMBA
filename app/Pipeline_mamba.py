@@ -85,6 +85,9 @@ def train_pipeline(
     selected_locations: list[str],
     target_col: str,
     feature_cols: list[str],
+    window_size: int,
+    horizon: int,
+    sample_stride: int,
     epochs: int,
     batch_size: int,
     lr: float,
@@ -98,6 +101,8 @@ def train_pipeline(
     log_interval: int,
     grad_accum_steps: int,
     max_grad_norm: float,
+    early_stop_patience: int,
+    early_stop_min_delta: float,
     run_dir: str | None = None,
     forecast_file_name: str = "future_24h_predictions.csv",
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
@@ -110,8 +115,8 @@ def train_pipeline(
         raise ValueError("Cần chọn ít nhất 1 location để train Mamba.")
 
     work_df = df.copy()
-    if "location_key" not in work_df.columns or "ts_utc" not in work_df.columns:
-        raise ValueError("Dataset train Mamba cần có cột 'location_key' và 'ts_utc'.")
+    if "location_key" not in work_df.columns or ("Time" not in work_df.columns and "ts_utc" not in work_df.columns):
+        raise ValueError("Dataset train Mamba cần có cột 'location_key' và 'Time' (hoặc 'ts_utc').")
 
     work_df = work_df.loc[
         work_df["location_key"].astype(str).isin([str(x) for x in selected_locations])
@@ -126,13 +131,12 @@ def train_pipeline(
             "Không load được module mamba/scripts/train_mamba_aqi.py để chạy Mamba sequence."
         )
 
-    window_size = 24
-    horizon = 1
     x_seq, loc_ids, y, y_ts, num_locations, ts_feature_cols = mod.build_time_series_samples(
         df=work_df,
         target_col=target_col,
         window_size=window_size,
         horizon=horizon,
+        sample_stride=sample_stride,
         feature_cols=feature_cols,
         include_target_history=True,
     )
@@ -175,22 +179,41 @@ def train_pipeline(
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
 
-    train_loader = DataLoader(train_ds, shuffle=(device.type == "cuda"), **loader_kwargs)
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
     test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
 
-    model = mod.TimeSeriesMambaRegressor(
+    raw_model = mod.TimeSeriesMambaRegressor(
         num_features=train_split.x_seq.shape[-1],
         num_locations=num_locations,
         d_model=d_model,
         n_layers=n_layers,
+        horizon=horizon,
     ).to(device)
+    model = raw_model
+
+    compile_enabled = False
+    try:
+        import triton  # noqa: F401
+        triton_available = True
+    except Exception:
+        triton_available = False
+
+    if device.type == "cuda" and triton_available and hasattr(torch, "compile"):
+        try:
+            torch._dynamo.config.suppress_errors = True
+            model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+            compile_enabled = True
+        except Exception:
+            compile_enabled = False
 
     criterion = nn.HuberLoss(delta=1.0) if loss_name == "huber" else nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=lr, weight_decay=weight_decay)
 
     best_val_loss = float("inf")
     best_state = None
+    epochs_without_improvement = 0
+    stopped_early = False
     history: list[dict] = []
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
@@ -278,15 +301,28 @@ def train_pipeline(
             }
         )
 
-        if val_metrics["loss"] < best_val_loss:
+        if val_metrics["loss"] < best_val_loss - early_stop_min_delta:
             best_val_loss = val_metrics["loss"]
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_state = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if early_stop_patience > 0 and epochs_without_improvement >= early_stop_patience:
+            stopped_early = True
+            stop_line = (
+                f"Early stopping at epoch {epoch}/{epochs} | "
+                f"best_val_loss={best_val_loss:.6f}"
+            )
+            log_lines.append(stop_line)
+            log_box.code("\n".join(log_lines[-20:]))
+            break
 
     if best_state is None:
         raise RuntimeError("Không có checkpoint hợp lệ trong quá trình train.")
 
-    model.load_state_dict(best_state)
-    model.to(device)
+    raw_model.load_state_dict(best_state)
+    raw_model.to(device)
     eval_start = time.time()
     val_metrics = mod.evaluate(model, val_loader, criterion, device, amp_enabled, y_mean, y_std)
     test_metrics = mod.evaluate(model, test_loader, criterion, device, amp_enabled, y_mean, y_std)
@@ -294,7 +330,8 @@ def train_pipeline(
 
     # --- Build loc_to_id mapping ---
     cleaned = work_df.copy()
-    cleaned["_ts"] = pd.to_datetime(cleaned["ts_utc"], utc=True, errors="coerce")
+    ts_col = "Time" if "Time" in cleaned.columns else "ts_utc"
+    cleaned["_ts"] = pd.to_datetime(cleaned[ts_col], utc=True, errors="coerce")
     cleaned = cleaned.dropna(subset=["_ts", "location_key", target_col]).copy()
     cleaned["_loc_id"] = cleaned["location_key"].astype("category").cat.codes.astype(np.int64)
     loc_to_id = (
@@ -314,6 +351,13 @@ def train_pipeline(
     ].copy()
     if base_df.empty:
         raise ValueError("Test CSV không có location trùng với dữ liệu train đã chọn.")
+
+    base_col_map = {c.lower(): c for c in base_df.columns}
+    base_ts_col = base_col_map.get("ts_utc") or base_col_map.get("time") or base_col_map.get("timestamp") or "_ts"
+    if base_ts_col not in base_df.columns:
+        raise ValueError("Cần có cột timestamp ('ts_utc', 'Time', hoặc 'timestamp') để dự báo 24h tiếp theo.")
+    if base_ts_col != "ts_utc":
+        base_df["ts_utc"] = base_df[base_ts_col]
 
     for col in ts_feature_cols:
         if col not in base_df.columns:
@@ -378,7 +422,8 @@ def train_pipeline(
 
             pred_all = pred_norm_all * y_std + y_mean
             for (ts_val, loc_val), pred_val in zip(infer_meta, pred_all):
-                preds_rows.append({"time": ts_val, "location": loc_val, "predicted": float(pred_val)})
+                pred_scalar = float(np.asarray(pred_val, dtype=np.float32).reshape(-1)[0])
+                preds_rows.append({"time": ts_val, "location": loc_val, "predicted": pred_scalar})
 
     forecast_sec = time.time() - forecast_start
 
@@ -406,18 +451,24 @@ def train_pipeline(
     future_pred_path = os.path.join(out_dir, forecast_file_name)
 
     io_start = time.time()
-    torch.save(model.state_dict(), model_path)
+    torch.save(raw_model.state_dict(), model_path)
     pd.DataFrame(history).to_csv(metrics_path, index=False)
     future_out.to_csv(future_pred_path, index=False)
     io_sec = time.time() - io_start
 
     summary = {
         "device": str(device),
+        "torch_compile": bool(compile_enabled),
+        "num_workers": int(num_workers),
+        "pin_memory": bool(pin_memory),
+        "persistent_workers": bool(num_workers > 0),
+        "grad_accum_steps": int(grad_accum_steps),
         "n_rows_used": len(y),
         "split_train": len(train_split.y),
         "split_val": len(val_split.y),
         "split_test": len(test_split.y),
         "feature_count_after_encode": train_split.x_seq.shape[-1],
+        "sample_stride": int(sample_stride),
         "encoded_features": ts_feature_cols,
         "val_loss": val_metrics["loss"],
         "val_r2": val_metrics["r2"],
@@ -435,6 +486,9 @@ def train_pipeline(
         "future_rows": len(future_out),
         "future_locations": int(future_out["location"].nunique()),
         "per_location_files": [],
+        "epochs_ran": len(history),
+        "stopped_early": stopped_early,
+        "best_val_loss": float(best_val_loss),
         "train_only_sec": float(pd.DataFrame(history)["train_sec"].sum()) if history else 0.0,
         "eval_sec": float(eval_sec),
         "forecast_sec": float(forecast_sec),

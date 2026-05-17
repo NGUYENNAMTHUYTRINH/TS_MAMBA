@@ -86,6 +86,7 @@ def main() -> None:
                 feature_cols=feature_cols,
                 window_size=train_cfg["window_size"],
                 horizon=train_cfg["horizon"],
+                sample_stride=train_cfg["sample_stride"],
                 epochs=train_cfg["epochs"],
                 batch_size=train_cfg["batch_size"],
                 lr=train_cfg["lr"],
@@ -94,13 +95,13 @@ def main() -> None:
                 n_layers=train_cfg["n_layers"],
                 loss_name=train_cfg["loss_name"],
                 seed=train_cfg["seed"],
-                num_workers=train_cfg["num_workers"],
+                num_workers=4,
                 use_gpu=train_cfg["use_gpu"],
                 log_interval=50,
                 grad_accum_steps=train_cfg["grad_accum_steps"],
                 max_grad_norm=train_cfg["max_grad_norm"],
                 early_stop_patience=train_cfg["early_stop_patience"],
-                early_stop_min_delta=train_cfg["early_stop_min_delta"],
+                early_stop_min_delta=0.0,
                 run_dir=mamba_run_dir,
             )
 

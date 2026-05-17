@@ -1,17 +1,10 @@
-# Environment notes (from current machine)
-# Python: 3.11.9
-# NVIDIA Driver: 512.74
-# CUDA Driver Runtime (nvidia-smi): 11.6
-# PyTorch build: 2.7.1+cu118 (CUDA 11.8)
-# torch.cuda.is_available(): True
-# GPU: NVIDIA GeForce RTX 3050 Laptop GPU
+# Environment notes (WSL guide)
+# Python: 3.10
+# Install PyTorch separately as in huongdan.md (GPU/CPU choice depends on machine)
 
-# Use the PyTorch cu118 wheel index for +cu118 builds
---extra-index-url https://download.pytorch.org/whl/cu118
-
-torch==2.7.1+cu118
-torchvision==0.22.1+cu118
-torchaudio==2.7.1+cu118
+torch
+torchvision
+torchaudio
 
 einops==0.8.2
 transformers>=4.40.0
@@ -31,6 +24,4 @@ joblib>=1.3.0
 tensorboard>=2.14.0
 packaging>=23.0
 
-# Installed package name is mamba_ssm (distribution mamba-ssm)
-#mamba-ssm==2.3.1
 
