@@ -22,6 +22,7 @@ import csv
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.data_structs import AQIDataset, SplitData
 from core.metrics import compute_metrics, denormalize
 from core.utils import resolve_device, set_seed, setup_logger
+from app.Utils import build_future_24h_frame, format_time_utc_strings
 from mamba.mamba_model import TimeSeriesMambaRegressor
 
 
@@ -253,12 +255,12 @@ def standardize(
     train: SplitData,
     val:   SplitData,
     test:  SplitData,
-) -> tuple[SplitData, SplitData, SplitData, float, float]:
+) -> tuple[SplitData, SplitData, SplitData, np.ndarray, np.ndarray, float, float]:
     """Chuẩn hoá x_seq và y dựa trên thống kê của tập train.
 
     Returns
     -------
-    train, val, test (đã normalize), y_mean, y_std
+    train, val, test (đã normalize), x_mean, x_std, y_mean, y_std
     """
     # X: normalize per-feature theo toàn bộ timestep của train
     x_mean = train.x_seq.mean(axis=(0, 1), keepdims=True)
@@ -277,7 +279,7 @@ def standardize(
     for split in [train, val, test]:
         split.y = (split.y - y_mean) / y_std
 
-    return train, val, test, y_mean, y_std
+    return train, val, test, x_mean, x_std, y_mean, y_std
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +417,7 @@ def main() -> None:
     parser.add_argument("--n-layers",         type=int,   default=2)
     parser.add_argument("--seed",             type=int,   default=42)
     parser.add_argument("--num-workers",      type=int,   default=0)
-    parser.add_argument("--out-dir",          type=str,   default="outputs")
+    parser.add_argument("--out-dir",          type=str,   default=None)
     parser.add_argument("--device",           type=str,   default="cuda", choices=["cuda", "cpu", "auto"])
     parser.add_argument("--location",         type=str,   default=None,   help="[Deprecated] Dùng --locations thay thế")
     parser.add_argument("--locations",        type=str,   default=None,   help="Comma-separated location_key list")
@@ -426,6 +428,9 @@ def main() -> None:
     parser.add_argument("--max-grad-norm",    type=float, default=1.0)
     parser.add_argument("--patience",         type=int,   default=5)
     parser.add_argument("--min-delta",        type=float, default=0.0)
+    parser.add_argument("--forecast-24h",     action="store_true", help="Generate next-24h forecast CSV")
+    parser.add_argument("--forecast-base",    type=str,   default=None, help="CSV path for forecast base (optional)")
+    parser.add_argument("--forecast-out",     type=str,   default=None)
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -434,9 +439,13 @@ def main() -> None:
         data_path = (project_root / data_path).resolve()
     args.data_path = str(data_path)
 
-    out_dir = Path(args.out_dir)
-    if not out_dir.is_absolute():
-        out_dir = (project_root / out_dir).resolve()
+    if args.out_dir is None:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = (project_root / "runs" / run_id).resolve()
+    else:
+        out_dir = Path(args.out_dir)
+        if not out_dir.is_absolute():
+            out_dir = (project_root / out_dir).resolve()
     args.out_dir = str(out_dir)
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -473,7 +482,7 @@ def main() -> None:
 
     # Split + Normalize
     train, val, test = split_data_by_timeline(x_seq, loc_ids, y, y_ts)
-    train, val, test, y_mean, y_std = standardize(train, val, test)
+    train, val, test, x_mean, x_std, y_mean, y_std = standardize(train, val, test)
     logger.info(
         "Split — train: %d | val: %d | test: %d",
         len(train.y), len(val.y), len(test.y),
@@ -574,6 +583,132 @@ def main() -> None:
         test_metrics.get("mae_norm", float("nan")),
         test_metrics.get("rmse_norm", float("nan")),
     )
+
+    if args.forecast_24h:
+        forecast_hours = int(args.horizon)
+        logger.info("Generating %dh forecast...", forecast_hours)
+        base_df = df.copy()
+        if args.forecast_base:
+            forecast_path = Path(args.forecast_base)
+            if not forecast_path.is_absolute():
+                forecast_path = (project_root / forecast_path).resolve()
+            base_df = pd.read_csv(forecast_path)
+
+        if "location_key" not in base_df.columns:
+            raise ValueError("Dataset forecast cần có cột 'location_key'.")
+
+        col_map = {c.lower(): c for c in base_df.columns}
+        base_ts_col = col_map.get("ts_utc") or col_map.get("time") or col_map.get("timestamp")
+        if base_ts_col is None:
+            raise ValueError("Cần có cột timestamp ('ts_utc', 'Time', hoặc 'timestamp') để dự báo tiếp theo.")
+        if base_ts_col != "ts_utc":
+            base_df["ts_utc"] = base_df[base_ts_col]
+
+        cleaned = df.copy()
+        clean_col_map = {c.lower(): c for c in cleaned.columns}
+        clean_ts_col = clean_col_map.get("ts_utc") or clean_col_map.get("time") or clean_col_map.get("timestamp")
+        if clean_ts_col is None:
+            raise ValueError("Dataset train không có cột timestamp hợp lệ để forecast.")
+        cleaned["_ts"] = pd.to_datetime(cleaned[clean_ts_col], utc=True, errors="coerce")
+        cleaned = cleaned.dropna(subset=["_ts", "location_key", args.target_col]).copy()
+        cleaned["_loc_id"] = cleaned["location_key"].astype("category").cat.codes.astype(np.int64)
+        loc_to_id = (
+            cleaned.assign(_loc_key_str=cleaned["location_key"].astype(str))
+            .drop_duplicates(subset=["_loc_key_str"])
+            .set_index("_loc_key_str")["_loc_id"]
+            .to_dict()
+        )
+
+        base_df = base_df.loc[
+            base_df["location_key"].astype(str).isin(list(loc_to_id.keys()))
+        ].copy()
+        if base_df.empty:
+            raise ValueError("Forecast base không có location trùng với dữ liệu train đã chọn.")
+
+        for col in feature_cols:
+            if col not in base_df.columns:
+                base_df[col] = np.nan
+            base_df[col] = pd.to_numeric(base_df[col], errors="coerce")
+            fill_val = base_df[col].median()
+            if pd.isna(fill_val):
+                fill_val = 0.0
+            base_df[col] = base_df[col].fillna(fill_val)
+
+        future_df = build_future_24h_frame(
+            base_df,
+            feature_cols=feature_cols,
+            target_col=args.target_col,
+            hours=forecast_hours,
+        )
+        for col in feature_cols:
+            future_df[col] = pd.to_numeric(future_df[col], errors="coerce")
+            fill_val = base_df[col].median() if col in base_df.columns else 0.0
+            if pd.isna(fill_val):
+                fill_val = 0.0
+            future_df[col] = future_df[col].fillna(fill_val)
+
+        preds_rows: list[dict] = []
+        model.eval()
+        infer_x, infer_loc, infer_meta = [], [], []
+        x_mean_2d = x_mean.squeeze(0)
+        x_std_2d = x_std.squeeze(0)
+
+        with torch.inference_mode():
+            for loc in sorted(future_df["location_key"].astype(str).unique().tolist()):
+                if loc not in loc_to_id:
+                    continue
+                loc_hist = (
+                    base_df.loc[base_df["location_key"].astype(str) == loc]
+                    .copy()
+                    .assign(ts_utc=lambda d: pd.to_datetime(d["ts_utc"], utc=True, errors="coerce"))
+                    .dropna(subset=["ts_utc"])
+                    .sort_values("ts_utc")
+                )
+                if len(loc_hist) < args.window_size:
+                    continue
+
+                rolling_window = loc_hist[feature_cols].tail(args.window_size).to_numpy(dtype=np.float32)
+                loc_future = (
+                    future_df.loc[future_df["location_key"].astype(str) == loc]
+                    .copy()
+                    .assign(ts_utc=lambda d: pd.to_datetime(d["ts_utc"], utc=True, errors="coerce"))
+                    .sort_values("ts_utc")
+                )
+
+                for _, row in loc_future.iterrows():
+                    x_norm = (rolling_window - x_mean_2d) / x_std_2d
+                    infer_x.append(x_norm.astype(np.float32, copy=False))
+                    infer_loc.append(int(loc_to_id[loc]))
+                    infer_meta.append((row["ts_utc"], loc))
+                    next_feats = row[feature_cols].to_numpy(dtype=np.float32).reshape(1, -1)
+                    rolling_window = np.concatenate([rolling_window[1:], next_feats], axis=0)
+
+            if infer_x:
+                x_all = torch.from_numpy(np.stack(infer_x, axis=0)).to(device, non_blocking=pin_memory)
+                loc_all = torch.tensor(infer_loc, dtype=torch.long, device=device)
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                    pred_norm_all = model(x_all, loc_all).detach().float().cpu().numpy()
+
+                pred_all = pred_norm_all * y_std + y_mean
+                for (ts_val, loc_val), pred_val in zip(infer_meta, pred_all):
+                    pred_scalar = float(np.asarray(pred_val, dtype=np.float32).reshape(-1)[0])
+                    preds_rows.append({"time": ts_val, "location": loc_val, "predicted": pred_scalar})
+
+        if not preds_rows:
+            raise RuntimeError("Không tạo được dự báo cho Mamba.")
+
+        future_out = (
+            pd.DataFrame(preds_rows)
+            .assign(time=lambda d: format_time_utc_strings(d["time"]))
+            [["time", "location", "predicted"]]
+            .sort_values(["location", "time"])
+            .reset_index(drop=True)
+        )
+
+        forecast_name = args.forecast_out or f"future_{forecast_hours}h_predictions.csv"
+        forecast_out = Path(args.out_dir) / forecast_name
+        future_out.to_csv(forecast_out, index=False)
+        logger.info("Forecast saved: %s", forecast_out)
     logger.info("Best model: %s", best_path)
     logger.info("History   : %s", history_path)
 

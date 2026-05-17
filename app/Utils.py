@@ -118,20 +118,20 @@ def load_train_module():
 # ---------------------------------------------------------------------------
 
 def build_future_24h_frame(
-    df_valid: pd.DataFrame, feature_cols: list[str], target_col: str
+    df_valid: pd.DataFrame, feature_cols: list[str], target_col: str, hours: int = 24
 ) -> pd.DataFrame:
-    """Tạo DataFrame dự báo 24h tiếp theo từ ngày cuối trong df_valid."""
+    """Tạo DataFrame dự báo hours tiếp theo từ ngày cuối trong df_valid."""
     normalized = df_valid.copy()
     col_map = {c.lower(): c for c in normalized.columns}
     ts_col = col_map.get("ts_utc") or col_map.get("time") or col_map.get("timestamp")
     if ts_col is None:
-        raise ValueError("Cần có cột timestamp ('ts_utc', 'Time', hoặc 'timestamp') để dự báo 24h tiếp theo.")
+        raise ValueError("Cần có cột timestamp ('ts_utc', 'Time', hoặc 'timestamp') để dự báo tiếp theo.")
     if ts_col != "ts_utc":
         normalized["ts_utc"] = normalized[ts_col]
     df_valid = normalized
 
     if "ts_utc" not in df_valid.columns:
-        raise ValueError("Cần có cột 'ts_utc' để dự báo 24h tiếp theo.")
+        raise ValueError("Cần có cột 'ts_utc' để dự báo tiếp theo.")
 
     work = df_valid.copy()
     work["ts_utc"] = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
@@ -152,13 +152,13 @@ def build_future_24h_frame(
 
         last_ts = g["ts_utc"].iloc[-1]
         next_day_start = last_ts.normalize() + pd.Timedelta(days=1)
-        template = g.tail(24).copy()
-        if len(template) < 24:
+        template = g.tail(hours).copy()
+        if len(template) < hours:
             template = pd.concat(
-                [template] * (24 // len(template) + 1), ignore_index=True
-            ).head(24)
+                [template] * (hours // len(template) + 1), ignore_index=True
+            ).head(hours)
 
-        for h in range(24):
+        for h in range(hours):
             src = template.iloc[h].copy()
             row = {col: src[col] for col in feature_cols if col in template.columns}
             if loc is not None:
@@ -168,7 +168,7 @@ def build_future_24h_frame(
             future_rows.append(row)
 
     if not future_rows:
-        raise ValueError("Không tạo được dữ liệu dự báo 24h.")
+        raise ValueError("Không tạo được dữ liệu dự báo.")
 
     return pd.DataFrame(future_rows)
 
