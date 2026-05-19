@@ -7,7 +7,6 @@ Chay bang: streamlit run app/Main.py
 
 from __future__ import annotations
 
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,14 +22,19 @@ for path in [str(APP_DIR), str(PROJECT_ROOT)]:
 
 from Pipeline_mamba import predict_with_saved_model, train_pipeline
 from Pipeline_lstm import predict_lstm_with_saved_model, train_lstm_pipeline
+from Pipeline_itransformer import (
+    predict_itransformer_with_saved_model,
+    train_itransformer_pipeline,
+)
 from Ui_components import (
     render_data_preview,
     render_forecast_download,
     render_location_selector,
-    render_mamba_results,
+    render_model_results,
     render_sidebar,
     render_train_config,
 )
+from Utils import model_run_dir
 
 
 def _selected_feature_cols(train_cfg: dict) -> list[str]:
@@ -51,6 +55,11 @@ def _default_checkpoint_path(project_root: Path, model_type: str) -> str:
             "LSTM-Time-Series-Forecasting/outputs/best_lstm.pt",
         ]
         fallback = project_root / "LSTM-Time-Series-Forecasting" / "outputs" / "best_lstm.pt"
+    elif model_type == "iTransformer":
+        patterns = [
+            "runs/itransformer/*/best_itransformer.pt",
+        ]
+        fallback = project_root / "runs" / "itransformer" / "best_itransformer.pt"
     else:
         patterns = [
             "runs/mamba/*/best_mamba_aqi.pt",
@@ -73,8 +82,12 @@ def _default_checkpoint_path(project_root: Path, model_type: str) -> str:
     return str(latest)
 
 
-def _model_run_dir(project_root: Path, model_name: str, timestamp: str) -> str:
-    return str(project_root / "runs" / model_name.lower() / timestamp)
+def _models_to_run(model_type: str) -> list[str]:
+    if model_type == "Tat ca":
+        return ["Mamba", "LSTM", "iTransformer"]
+    if "+" in model_type:
+        return [part.strip() for part in model_type.split("+")]
+    return [model_type]
 
 
 def _render_comparison(results: list[tuple[str, dict, object, object]]) -> None:
@@ -127,6 +140,130 @@ def _render_best_model(results: list[tuple[str, dict, object, object]]) -> None:
     c4.metric("Test R2", f"{_metric_value(summary, 'test_r2', float('nan')):.4f}")
 
 
+def _predict_model(
+    name: str,
+    df,
+    selected_locations: list[str],
+    train_cfg: dict,
+    feature_cols: list[str],
+    checkpoint_paths: dict[str, str],
+    project_root: Path,
+    timestamp: str,
+):
+    if name == "LSTM":
+        return predict_lstm_with_saved_model(
+            df=df,
+            selected_locations=selected_locations,
+            target_col=train_cfg["target_col"],
+            feature_cols=feature_cols,
+            checkpoint_path=checkpoint_paths["LSTM"],
+            batch_size=train_cfg["batch_size"],
+            use_gpu=train_cfg["use_gpu"],
+            run_dir=model_run_dir(project_root, "lstm", timestamp),
+        )
+    if name == "iTransformer":
+        return predict_itransformer_with_saved_model(
+            df=df,
+            selected_locations=selected_locations,
+            target_col=train_cfg["target_col"],
+            feature_cols=feature_cols,
+            checkpoint_path=checkpoint_paths["iTransformer"],
+            batch_size=train_cfg["batch_size"],
+            use_gpu=train_cfg["use_gpu"],
+            run_dir=model_run_dir(project_root, "itransformer", timestamp),
+        )
+    return predict_with_saved_model(
+        df=df,
+        forecast_base_df=None,
+        selected_locations=selected_locations,
+        target_col=train_cfg["target_col"],
+        feature_cols=feature_cols,
+        window_size=train_cfg["window_size"],
+        horizon=train_cfg["horizon"],
+        sample_stride=train_cfg["sample_stride"],
+        loss_name=train_cfg["loss_name"],
+        batch_size=train_cfg["batch_size"],
+        use_gpu=train_cfg["use_gpu"],
+        checkpoint_path=checkpoint_paths["Mamba"],
+        run_dir=model_run_dir(project_root, "mamba", timestamp),
+    )
+
+
+def _train_model(
+    name: str,
+    df,
+    selected_locations: list[str],
+    train_cfg: dict,
+    feature_cols: list[str],
+    project_root: Path,
+    timestamp: str,
+):
+    if name == "LSTM":
+        return train_lstm_pipeline(
+            df=df,
+            selected_locations=selected_locations,
+            target_col=train_cfg["target_col"],
+            feature_cols=feature_cols,
+            window_size=train_cfg["window_size"],
+            horizon=train_cfg["horizon"],
+            epochs=train_cfg["epochs"],
+            batch_size=train_cfg["batch_size"],
+            lr=train_cfg["lr"],
+            hidden_size=train_cfg["d_model"],
+            num_layers=train_cfg["n_layers"],
+            loss_name=train_cfg["loss_name"],
+            seed=train_cfg["seed"],
+            use_gpu=train_cfg["use_gpu"],
+            early_stop_patience=train_cfg["early_stop_patience"],
+            run_dir=model_run_dir(project_root, "lstm", timestamp),
+        )
+    if name == "iTransformer":
+        return train_itransformer_pipeline(
+            df=df,
+            selected_locations=selected_locations,
+            target_col=train_cfg["target_col"],
+            feature_cols=feature_cols,
+            window_size=train_cfg["window_size"],
+            horizon=train_cfg["horizon"],
+            epochs=train_cfg["epochs"],
+            batch_size=train_cfg["batch_size"],
+            lr=train_cfg["lr"],
+            d_model=train_cfg["d_model"],
+            n_layers=train_cfg["n_layers"],
+            loss_name=train_cfg["loss_name"],
+            seed=train_cfg["seed"],
+            use_gpu=train_cfg["use_gpu"],
+            early_stop_patience=train_cfg["early_stop_patience"],
+            run_dir=model_run_dir(project_root, "itransformer", timestamp),
+        )
+    return train_pipeline(
+        df=df,
+        forecast_base_df=None,
+        selected_locations=selected_locations,
+        target_col=train_cfg["target_col"],
+        feature_cols=feature_cols,
+        window_size=train_cfg["window_size"],
+        horizon=train_cfg["horizon"],
+        sample_stride=train_cfg["sample_stride"],
+        epochs=train_cfg["epochs"],
+        batch_size=train_cfg["batch_size"],
+        lr=train_cfg["lr"],
+        weight_decay=train_cfg["weight_decay"],
+        d_model=train_cfg["d_model"],
+        n_layers=train_cfg["n_layers"],
+        loss_name=train_cfg["loss_name"],
+        seed=train_cfg["seed"],
+        num_workers=4,
+        use_gpu=train_cfg["use_gpu"],
+        log_interval=50,
+        grad_accum_steps=train_cfg["grad_accum_steps"],
+        max_grad_norm=train_cfg["max_grad_norm"],
+        early_stop_patience=train_cfg["early_stop_patience"],
+        early_stop_min_delta=0.0,
+        run_dir=model_run_dir(project_root, "mamba", timestamp),
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="AQI Mamba", layout="wide")
     st.title("AQI Forecasting: Mamba")
@@ -149,24 +286,23 @@ def main() -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     st.subheader("Model")
-    model_type = st.selectbox("Loai model", ["Mamba", "LSTM", "Mamba + LSTM"], index=0)
+    model_type = st.selectbox(
+        "Loai model",
+        ["Mamba", "LSTM", "iTransformer", "Mamba + LSTM", "Tat ca"],
+        index=0,
+    )
     checkpoint_paths: dict[str, str] = {}
-    if model_type == "Mamba + LSTM":
-        cp1, cp2 = st.columns(2)
-        with cp1:
-            checkpoint_paths["Mamba"] = st.text_input(
-                "Checkpoint Mamba da train",
-                value=_default_checkpoint_path(project_root, "Mamba"),
-                key="checkpoint_path_mamba_compare",
-                help="Streamlit se load checkpoint va chay inference moi.",
-            )
-        with cp2:
-            checkpoint_paths["LSTM"] = st.text_input(
-                "Checkpoint LSTM da train",
-                value=_default_checkpoint_path(project_root, "LSTM"),
-                key="checkpoint_path_lstm_compare",
-                help="Streamlit se load checkpoint va chay inference moi.",
-            )
+    models_for_inputs = _models_to_run(model_type)
+    if len(models_for_inputs) > 1:
+        cols = st.columns(len(models_for_inputs))
+        for col, name in zip(cols, models_for_inputs):
+            with col:
+                checkpoint_paths[name] = st.text_input(
+                    f"Checkpoint {name} da train",
+                    value=_default_checkpoint_path(project_root, name),
+                    key=f"checkpoint_path_{name.lower()}_compare",
+                    help="Streamlit se load checkpoint va chay inference moi.",
+                )
     else:
         checkpoint_paths[model_type] = st.text_input(
             "Checkpoint da train",
@@ -196,88 +332,34 @@ def main() -> None:
         try:
             if predict_clicked:
                 status_placeholder.info("Dang load checkpoint va chay inference moi tren Streamlit...")
-                models_to_run = ["Mamba", "LSTM"] if model_type == "Mamba + LSTM" else [model_type]
+                models_to_run = _models_to_run(model_type)
                 for name in models_to_run:
-                    if name == "LSTM":
-                        summary, hist_df, future_df = predict_lstm_with_saved_model(
-                            df=df,
-                            selected_locations=selected_locations,
-                            target_col=train_cfg["target_col"],
-                            feature_cols=feature_cols,
-                            checkpoint_path=checkpoint_paths["LSTM"],
-                            batch_size=train_cfg["batch_size"],
-                            use_gpu=train_cfg["use_gpu"],
-                            run_dir=_model_run_dir(project_root, "lstm", timestamp),
-                        )
-                    else:
-                        summary, hist_df, future_df = predict_with_saved_model(
-                            df=df,
-                            forecast_base_df=None,
-                            selected_locations=selected_locations,
-                            target_col=train_cfg["target_col"],
-                            feature_cols=feature_cols,
-                            window_size=train_cfg["window_size"],
-                            horizon=train_cfg["horizon"],
-                            sample_stride=train_cfg["sample_stride"],
-                            loss_name=train_cfg["loss_name"],
-                            batch_size=train_cfg["batch_size"],
-                            use_gpu=train_cfg["use_gpu"],
-                            checkpoint_path=checkpoint_paths["Mamba"],
-                            run_dir=_model_run_dir(project_root, "mamba", timestamp),
-                        )
+                    summary, hist_df, future_df = _predict_model(
+                        name,
+                        df,
+                        selected_locations,
+                        train_cfg,
+                        feature_cols,
+                        checkpoint_paths,
+                        project_root,
+                        timestamp,
+                    )
                     results.append((name, summary, hist_df, future_df))
                 status_placeholder.success("Da du doan xong bang checkpoint.")
 
             else:
                 status_placeholder.info(f"Dang huan luyen {model_type}...")
-                models_to_run = ["Mamba", "LSTM"] if model_type == "Mamba + LSTM" else [model_type]
+                models_to_run = _models_to_run(model_type)
                 for name in models_to_run:
-                    if name == "LSTM":
-                        summary, hist_df, future_df = train_lstm_pipeline(
-                            df=df,
-                            selected_locations=selected_locations,
-                            target_col=train_cfg["target_col"],
-                            feature_cols=feature_cols,
-                            window_size=train_cfg["window_size"],
-                            horizon=train_cfg["horizon"],
-                            epochs=train_cfg["epochs"],
-                            batch_size=train_cfg["batch_size"],
-                            lr=train_cfg["lr"],
-                            hidden_size=train_cfg["d_model"],
-                            num_layers=train_cfg["n_layers"],
-                            loss_name=train_cfg["loss_name"],
-                            seed=train_cfg["seed"],
-                            use_gpu=train_cfg["use_gpu"],
-                            early_stop_patience=train_cfg["early_stop_patience"],
-                            run_dir=_model_run_dir(project_root, "lstm", timestamp),
-                        )
-                    else:
-                        summary, hist_df, future_df = train_pipeline(
-                            df=df,
-                            forecast_base_df=None,
-                            selected_locations=selected_locations,
-                            target_col=train_cfg["target_col"],
-                            feature_cols=feature_cols,
-                            window_size=train_cfg["window_size"],
-                            horizon=train_cfg["horizon"],
-                            sample_stride=train_cfg["sample_stride"],
-                            epochs=train_cfg["epochs"],
-                            batch_size=train_cfg["batch_size"],
-                            lr=train_cfg["lr"],
-                            weight_decay=train_cfg["weight_decay"],
-                            d_model=train_cfg["d_model"],
-                            n_layers=train_cfg["n_layers"],
-                            loss_name=train_cfg["loss_name"],
-                            seed=train_cfg["seed"],
-                            num_workers=4,
-                            use_gpu=train_cfg["use_gpu"],
-                            log_interval=50,
-                            grad_accum_steps=train_cfg["grad_accum_steps"],
-                            max_grad_norm=train_cfg["max_grad_norm"],
-                            early_stop_patience=train_cfg["early_stop_patience"],
-                            early_stop_min_delta=0.0,
-                            run_dir=_model_run_dir(project_root, "mamba", timestamp),
-                        )
+                    summary, hist_df, future_df = _train_model(
+                        name,
+                        df,
+                        selected_locations,
+                        train_cfg,
+                        feature_cols,
+                        project_root,
+                        timestamp,
+                    )
                     results.append((name, summary, hist_df, future_df))
                 status_placeholder.success(f"Hoan thanh huan luyen {model_type}.")
 
@@ -295,7 +377,7 @@ def main() -> None:
         for name, summary, hist_df, future_df in results:
             st.divider()
             st.write(f"### {name} result")
-            render_mamba_results(summary, hist_df)
+            render_model_results(summary, hist_df)
             if future_df is not None:
                 render_forecast_download(future_df, summary, key_prefix=name.lower())
 

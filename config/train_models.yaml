@@ -1,13 +1,13 @@
 run:
   name: null
-  models: ["mamba", "lstm"]
+  models: ["mamba", "lstm", "itransformer"]
   output_root: runs
 
 common:
   data_path: dataset/air_quality.csv
   target_col: aqi
   locations: []
-  epochs: 20
+  epochs: 10
   batch_size: 32
   window_size: 72
   horizon: 12
@@ -15,14 +15,14 @@ common:
   loss: huber
   seed: 42
   num_workers: 0
+  d_model: 64
+  n_layers: 2
 
 mamba:
   enabled: true
   device: cuda
   amp: true
   sample_stride: 4
-  d_model: 64
-  n_layers: 2
   weight_decay: 0.0001
   grad_accum_steps: 1
   max_grad_norm: 1.0
@@ -34,10 +34,32 @@ mamba:
 
 lstm:
   enabled: true
-  hidden_size: 64
-  num_layers: 2
   embed_dim: 16
   early_stop_patience: 3
   overfit_threshold: 0.05
   predict: false
   output_csv: null
+
+itransformer:
+  enabled: true
+  device: cuda
+  gpu: 0
+  model_id: air_quality_AQI
+  model: Transformer
+  features: MS
+  freq: h
+  label_len: 48
+  d_layers: 1
+  enc_in: 11
+  dec_in: 11
+  c_out: 1
+  d_ff: 128
+  n_heads: 8
+  factor: 1
+  dropout: 0.1
+  embed: timeF
+  activation: gelu
+  patience: 3
+  des: Exp
+  inverse: true
+  use_amp: false

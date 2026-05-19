@@ -26,28 +26,13 @@ if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
 from core.metrics import compute_metrics
+from Utils import get_timestamp_col, normalize_locations
 
 LSTM_ROOT = APP_ROOT / "LSTM-Time-Series-Forecasting"
 if str(LSTM_ROOT) not in sys.path:
     sys.path.insert(0, str(LSTM_ROOT))
 
 from src.model import ImprovedLSTMForecaster
-
-
-def _timestamp_col(df: pd.DataFrame) -> str:
-    col_map = {c.lower(): c for c in df.columns}
-    ts_col = col_map.get("time") or col_map.get("ts_utc") or col_map.get("timestamp")
-    if ts_col is None:
-        raise ValueError("Dataset can co cot Time, ts_utc hoac timestamp.")
-    return ts_col
-
-
-def _normalize_locations(value) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [x.strip() for x in value.split(",") if x.strip()]
-    return [str(x).strip() for x in value if str(x).strip()]
 
 
 def _make_windows(values: np.ndarray, target_idx: int, lookback: int, horizon: int):
@@ -70,13 +55,13 @@ def _prepare_lstm_data(
     lookback: int,
     horizon: int,
 ):
-    selected_locations = _normalize_locations(selected_locations)
+    selected_locations = normalize_locations(selected_locations)
     if not selected_locations:
         raise ValueError("Can chon it nhat 1 location.")
     if "location_key" not in df.columns:
         raise ValueError("Dataset can co cot location_key.")
 
-    ts_col = _timestamp_col(df)
+    ts_col = get_timestamp_col(df)
     work = df.copy()
     work["_ts"] = pd.to_datetime(work[ts_col], utc=True, errors="coerce")
     work = work.loc[work["location_key"].astype(str).isin(selected_locations)].copy()
@@ -215,8 +200,8 @@ def _prepare_lstm_eval_data(
 ):
     if "location_key" not in df.columns:
         raise ValueError("Dataset can co cot location_key.")
-    ts_col = _timestamp_col(df)
-    selected = set(_normalize_locations(selected_locations))
+    ts_col = get_timestamp_col(df)
+    selected = set(normalize_locations(selected_locations))
     work = df.copy()
     work["_ts"] = pd.to_datetime(work[ts_col], utc=True, errors="coerce")
     work = work.dropna(subset=["_ts", "location_key", target_col]).sort_values(["location_key", "_ts"])
@@ -278,7 +263,7 @@ def _forecast_from_model(
     horizon: int,
     device,
 ) -> pd.DataFrame:
-    ts_col = _timestamp_col(df)
+    ts_col = get_timestamp_col(df)
     work = df.copy()
     work["_ts"] = pd.to_datetime(work[ts_col], utc=True, errors="coerce")
     rows = []
@@ -547,7 +532,7 @@ def predict_lstm_with_saved_model(
     target_idx = int(ckpt["target_idx"])
     loc_to_id = {str(k): int(v) for k, v in ckpt.get("loc_to_id", {}).items()}
     if not loc_to_id:
-        selected = _normalize_locations(selected_locations)
+        selected = normalize_locations(selected_locations)
         loc_to_id = {loc: idx for idx, loc in enumerate(sorted(selected))}
 
     scaler_path = ckpt_path.parent / "scalers.pkl"
@@ -579,7 +564,7 @@ def predict_lstm_with_saved_model(
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    selected = set(_normalize_locations(selected_locations))
+    selected = set(normalize_locations(selected_locations))
     if selected:
         loc_to_id = {loc: idx for loc, idx in loc_to_id.items() if loc in selected}
 

@@ -131,7 +131,7 @@ def render_location_selector(df: pd.DataFrame) -> list[str]:
         "Chon dia diem de du doan hoac train lai",
         options=locations,
         default=locations[: min(3, len(locations))],
-        help="Khi predict bang checkpoint, hay chon dung location da dung luc train.",
+        help="Khi predict bang checkpoint, hay chon dung location da dung luc train. iTransformer hien chay 1 location moi lan.",
     )
 
     if selected_locations:
@@ -269,7 +269,7 @@ def render_train_config() -> dict:
     }
 
 
-def render_mamba_results(
+def render_model_results(
     summary: dict,
     hist_df: pd.DataFrame,
 ) -> None:

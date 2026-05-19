@@ -1,24 +1,22 @@
 """
 utils.py
 --------
-Các hàm tiện ích dùng chung cho toàn bộ app (normalize, format, v.v.)
+Shared helpers for the Streamlit app and model pipelines.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 
-# ---------------------------------------------------------------------------
-# Normalize / format helpers
-# ---------------------------------------------------------------------------
-
 def normalize_locations(value) -> list[str]:
-    """Chuẩn hoá đầu vào thành list[str] cho selected_locations."""
+    """Normalize a location input into list[str]."""
     if value is None:
         return []
     if isinstance(value, str):
@@ -35,72 +33,39 @@ def format_time_utc_strings(values: pd.Series) -> pd.Series:
     return ts.dt.strftime("%Y-%m-%d %H:%M:%S+00:00")
 
 
-def synthesize_tft_time_from_dataset(repo_root: Path, locations: pd.Series) -> pd.Series:
-    """Tạo hourly UTC timestamps per location khi TFT output không có time column."""
-    dataset_path = repo_root / "dataset" / "2025.csv"
-    loc_series = locations.astype(str).reset_index(drop=True)
-    out = pd.Series(index=loc_series.index, dtype="object")
-
-    base_map: dict[str, pd.Timestamp] = {}
-    global_base = pd.Timestamp("2025-01-01 00:00:00", tz="UTC")
-
-    if dataset_path.exists():
-        try:
-            src = pd.read_csv(dataset_path, usecols=["location_key", "ts_utc"])
-            src["ts_utc"] = pd.to_datetime(src["ts_utc"], utc=True, errors="coerce")
-            src = src.dropna(subset=["location_key", "ts_utc"]).copy()
-            if not src.empty:
-                max_per_loc = src.groupby(src["location_key"].astype(str))["ts_utc"].max()
-                for k, v in max_per_loc.items():
-                    base_map[str(k)] = v + pd.Timedelta(hours=1)
-                global_base = src["ts_utc"].max() + pd.Timedelta(hours=1)
-        except Exception:
-            pass
-
-    for loc, idx in loc_series.groupby(loc_series).groups.items():
-        idx_list = list(idx)
-        start = base_map.get(str(loc), global_base)
-        rng = pd.date_range(start=start, periods=len(idx_list), freq="h", tz="UTC")
-        out.loc[idx_list] = rng.strftime("%Y-%m-%d %H:%M:%S+00:00")
-
-    return out
+def get_timestamp_col(df: pd.DataFrame) -> str:
+    """Return the timestamp column used by the AQI datasets."""
+    col_map = {c.lower(): c for c in df.columns}
+    ts_col = col_map.get("ts_utc") or col_map.get("time") or col_map.get("timestamp")
+    if ts_col is None:
+        raise ValueError("Dataset can co cot Time, ts_utc hoac timestamp.")
+    return ts_col
 
 
-# ---------------------------------------------------------------------------
-# Dynamic module loader
-# ---------------------------------------------------------------------------
+def model_run_dir(project_root: Path, model_name: str, timestamp: str) -> str:
+    """Build the standard runs/<model>/<timestamp> path."""
+    return str(project_root / "runs" / model_name.lower() / timestamp)
+
+
+def write_json(path: str | Path, data: dict[str, Any]) -> None:
+    """Write JSON with stable UTF-8 formatting."""
+    Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
 
 def load_train_module():
-    """Load động mamba/train_mamba_aqi.py và trả về module.
-
-    Sau khi tách cấu trúc, file nằm ở:
-        project_root/mamba/train_mamba_aqi.py   (không còn thư mục scripts/)
-
-    Cần thêm project_root vào sys.path để train_mamba_aqi.py tìm được:
-        from core.data_structs import ...
-        from core.metrics import ...
-        from core.utils import ...
-        from mamba.mamba_model import ...
-    """
+    """Load mamba/train_mamba_aqi.py dynamically for Streamlit helpers."""
     import sys
 
     try:
-        project_root = Path(__file__).parent.parent          # app/ -> project root
+        project_root = Path(__file__).parent.parent
         mod_path = project_root / "mamba" / "train_mamba_aqi.py"
-
         if not mod_path.exists():
-            raise FileNotFoundError(f"Không tìm thấy: {mod_path}")
+            raise FileNotFoundError(f"Khong tim thay: {mod_path}")
 
-        # Thêm project_root vào sys.path để các import "from core.xxx" trong
-        # train_mamba_aqi.py hoạt động đúng khi load động bằng importlib.
-        root_str = str(project_root)
-        if root_str not in sys.path:
-            sys.path.insert(0, root_str)
-
-        # Thêm thư mục mamba để import trực tiếp mamba_ssm (local source).
-        mamba_str = str(project_root / "mamba")
-        if mamba_str not in sys.path:
-            sys.path.insert(0, mamba_str)
+        for path in [project_root, project_root / "mamba"]:
+            path_str = str(path)
+            if path_str not in sys.path:
+                sys.path.insert(0, path_str)
 
         spec = importlib.util.spec_from_file_location(
             "train_mamba_aqi_for_streamlit", str(mod_path)
@@ -108,32 +73,20 @@ def load_train_module():
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
-
     except Exception:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Data helpers
-# ---------------------------------------------------------------------------
-
 def build_future_24h_frame(
     df_valid: pd.DataFrame, feature_cols: list[str], target_col: str, hours: int = 24
 ) -> pd.DataFrame:
-    """Tạo DataFrame dự báo hours tiếp theo từ ngày cuối trong df_valid."""
+    """Build the next-day hourly frame used by forecast pipelines."""
     normalized = df_valid.copy()
-    col_map = {c.lower(): c for c in normalized.columns}
-    ts_col = col_map.get("ts_utc") or col_map.get("time") or col_map.get("timestamp")
-    if ts_col is None:
-        raise ValueError("Cần có cột timestamp ('ts_utc', 'Time', hoặc 'timestamp') để dự báo tiếp theo.")
+    ts_col = get_timestamp_col(normalized)
     if ts_col != "ts_utc":
         normalized["ts_utc"] = normalized[ts_col]
-    df_valid = normalized
 
-    if "ts_utc" not in df_valid.columns:
-        raise ValueError("Cần có cột 'ts_utc' để dự báo tiếp theo.")
-
-    work = df_valid.copy()
+    work = normalized.copy()
     work["ts_utc"] = pd.to_datetime(work["ts_utc"], utc=True, errors="coerce")
     work = work.dropna(subset=["ts_utc"]).copy()
 
@@ -146,29 +99,29 @@ def build_future_24h_frame(
     else:
         groups = [(None, work.sort_values("ts_utc").copy())]
 
-    for loc, g in groups:
-        if g.empty:
+    for loc, group in groups:
+        if group.empty:
             continue
 
-        last_ts = g["ts_utc"].iloc[-1]
+        last_ts = group["ts_utc"].iloc[-1]
         next_day_start = last_ts.normalize() + pd.Timedelta(days=1)
-        template = g.tail(hours).copy()
+        template = group.tail(hours).copy()
         if len(template) < hours:
             template = pd.concat(
                 [template] * (hours // len(template) + 1), ignore_index=True
             ).head(hours)
 
-        for h in range(hours):
-            src = template.iloc[h].copy()
+        for hour in range(hours):
+            src = template.iloc[hour].copy()
             row = {col: src[col] for col in feature_cols if col in template.columns}
             if loc is not None:
                 row["location_key"] = loc
-            row["ts_utc"] = next_day_start + pd.Timedelta(hours=h)
+            row["ts_utc"] = next_day_start + pd.Timedelta(hours=hour)
             row[target_col] = np.nan
             future_rows.append(row)
 
     if not future_rows:
-        raise ValueError("Không tạo được dữ liệu dự báo.")
+        raise ValueError("Khong tao duoc du lieu du bao.")
 
     return pd.DataFrame(future_rows)
 
@@ -181,7 +134,7 @@ def split_data_by_timeline(
     train_ratio: float = 0.7,
     val_ratio: float = 0.1,
 ):
-    """Fallback split theo timeline khi module scripts không load được."""
+    """Fallback timeline split when the training module cannot be loaded."""
     if len(y) < 3:
         raise ValueError("Need at least 3 samples for train/val/test split.")
 

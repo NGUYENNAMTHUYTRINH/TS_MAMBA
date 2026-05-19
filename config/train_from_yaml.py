@@ -74,8 +74,8 @@ def build_mamba_cmd(cfg: dict[str, Any], run_name: str) -> list[str]:
         "--num-workers", str(common.get("num_workers", 0)),
         "--device", str(mamba.get("device", "cuda")),
         "--weight-decay", str(mamba.get("weight_decay", 0.0001)),
-        "--d-model", str(mamba.get("d_model", 64)),
-        "--n-layers", str(mamba.get("n_layers", 2)),
+        "--d-model", str(common.get("d_model", 64)),
+        "--n-layers", str(common.get("n_layers", 2)),
         "--grad-accum-steps", str(mamba.get("grad_accum_steps", 1)),
         "--max-grad-norm", str(mamba.get("max_grad_norm", 1.0)),
         "--patience", str(mamba.get("patience", 5)),
@@ -110,8 +110,8 @@ def build_lstm_cmd(cfg: dict[str, Any], run_name: str) -> list[str]:
         "--batch-size", str(common.get("batch_size", 32)),
         "--lookback", str(common.get("window_size", 72)),
         "--horizon", str(common.get("horizon", 12)),
-        "--hidden_size", str(lstm.get("hidden_size", 64)),
-        "--num_layers", str(lstm.get("num_layers", 2)),
+        "--hidden_size", str(common.get("d_model", 64)),
+        "--num_layers", str(common.get("n_layers", 2)),
         "--embed_dim", str(lstm.get("embed_dim", 16)),
         "--lr", str(common.get("lr", 0.001)),
         "--loss", str(common.get("loss", "huber")),
@@ -131,8 +131,59 @@ def build_lstm_cmd(cfg: dict[str, Any], run_name: str) -> list[str]:
     return cmd
 
 
+def build_itransformer_cmd(cfg: dict[str, Any], run_name: str) -> list[str]:
+    common = cfg.get("common", {})
+    itransformer = cfg.get("itransformer", {})
+    output_root = cfg.get("run", {}).get("output_root", "runs")
+    out_dir = PROJECT_ROOT / output_root / "itransformer" / run_name
+    locations = _as_list(common.get("locations"))
+
+    cmd = [
+        sys.executable,
+        "app/Pipeline_itransformer.py",
+        "--data-path", str(common.get("data_path", "dataset/air_quality.csv")),
+        "--target-col", str(common.get("target_col", "aqi")),
+        "--epochs", str(common.get("epochs", 20)),
+        "--window-size", str(common.get("window_size", 72)),
+        "--horizon", str(common.get("horizon", 12)),
+        "--batch-size", str(common.get("batch_size", 32)),
+        "--lr", str(common.get("lr", 0.001)),
+        "--loss", str(common.get("loss", "huber")),
+        "--seed", str(common.get("seed", 42)),
+        "--device", str(itransformer.get("device", "cuda")),
+        "--model-id", str(itransformer.get("model_id", "air_quality_AQI")),
+        "--model", str(itransformer.get("model", "Transformer")),
+        "--features", str(itransformer.get("features", "MS")),
+        "--freq", str(itransformer.get("freq", "h")),
+        "--label-len", str(itransformer.get("label_len", 48)),
+        "--n-heads", str(itransformer.get("n_heads", 8)),
+        "--d-model", str(common.get("d_model", 128)),
+        "--n-layers", str(common.get("n_layers", 3)),
+        "--d-layers", str(itransformer.get("d_layers", 1)),
+        "--d-ff", str(itransformer.get("d_ff", 128)),
+        "--factor", str(itransformer.get("factor", 1)),
+        "--dropout", str(itransformer.get("dropout", 0.1)),
+        "--embed", str(itransformer.get("embed", "timeF")),
+        "--activation", str(itransformer.get("activation", "gelu")),
+        "--des", str(itransformer.get("des", "Exp")),
+        "--gpu", str(itransformer.get("gpu", 0)),
+        "--enc-in", str(itransformer.get("enc_in", 11)),
+        "--dec-in", str(itransformer.get("dec_in", 11)),
+        "--c-out", str(itransformer.get("c_out", 1)),
+        "--patience", str(itransformer.get("patience", 3)),
+        "--out-dir", str(out_dir),
+    ]
+    if _bool(itransformer.get("use_amp", False)):
+        cmd.append("--use-amp")
+    if not _bool(itransformer.get("inverse", True)):
+        cmd.append("--no-inverse")
+    if locations:
+        cmd.extend(["--locations", ",".join(locations)])
+    return cmd
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train Mamba and LSTM from one YAML config.")
+    parser = argparse.ArgumentParser(description="Train Mamba, LSTM, and iTransformer from one YAML config.")
     parser.add_argument("--config", default="train_models.yaml", help="Path to YAML config.")
     args = parser.parse_args()
 
@@ -154,10 +205,13 @@ def main() -> None:
         _run(build_mamba_cmd(cfg, run_name))
     if "lstm" in models and _bool(cfg.get("lstm", {}).get("enabled", True)):
         _run(build_lstm_cmd(cfg, run_name))
+    if "itransformer" in models and _bool(cfg.get("itransformer", {}).get("enabled", True)):
+        _run(build_itransformer_cmd(cfg, run_name))
 
     print("\nDone.")
     print(f"Mamba: {PROJECT_ROOT / run_cfg.get('output_root', 'runs') / 'mamba' / run_name}")
     print(f"LSTM : {PROJECT_ROOT / run_cfg.get('output_root', 'runs') / 'lstm' / run_name}")
+    print(f"iTransformer: {PROJECT_ROOT / run_cfg.get('output_root', 'runs') / 'itransformer' / run_name}")
 
 
 if __name__ == "__main__":
