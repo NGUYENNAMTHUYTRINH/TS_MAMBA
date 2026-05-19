@@ -1,0 +1,43 @@
+run:
+  name: null
+  models: ["mamba", "lstm"]
+  output_root: runs
+
+common:
+  data_path: dataset/air_quality.csv
+  target_col: aqi
+  locations: []
+  epochs: 20
+  batch_size: 32
+  window_size: 72
+  horizon: 12
+  lr: 0.001
+  loss: huber
+  seed: 42
+  num_workers: 0
+
+mamba:
+  enabled: true
+  device: cuda
+  amp: true
+  sample_stride: 4
+  d_model: 64
+  n_layers: 2
+  weight_decay: 0.0001
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+  patience: 5
+  min_delta: 0.0
+  forecast_24h: false
+  forecast_base: null
+  forecast_out: null
+
+lstm:
+  enabled: true
+  hidden_size: 64
+  num_layers: 2
+  embed_dim: 16
+  early_stop_patience: 3
+  overfit_threshold: 0.05
+  predict: false
+  output_csv: null

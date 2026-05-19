@@ -101,3 +101,7 @@ chạy
   --batch-size 128 \
   --device cuda \
   --amp
+
+
+chạy train model
+python config/train_from_yaml.py --config train_models.yaml

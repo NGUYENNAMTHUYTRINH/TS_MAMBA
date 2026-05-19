@@ -441,7 +441,7 @@ def main() -> None:
 
     if args.out_dir is None:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = (project_root / "runs" / run_id).resolve()
+        out_dir = (project_root / "runs" / "mamba" / run_id).resolve()
     else:
         out_dir = Path(args.out_dir)
         if not out_dir.is_absolute():

@@ -8,9 +8,14 @@ from __future__ import annotations
 
 import os
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+for path in [APP_DIR, PROJECT_ROOT]:
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 import time
+from contextlib import nullcontext
 from datetime import datetime
 
 import numpy as np
@@ -18,15 +23,14 @@ import pandas as pd
 import streamlit as st
 import torch
 import torch.nn as nn
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from torch.utils.data import DataLoader
 
+from core.metrics import compute_metrics, denormalize
 from Utils import (
     build_future_24h_frame,
     format_time_utc_strings,
     load_train_module,
     normalize_locations,
-    split_data_by_timeline,
 )
 
 
@@ -52,27 +56,23 @@ def evaluate(model, loader, criterion, device, y_mean: float, y_std: float) -> d
         preds.append(out.detach().cpu().numpy())
         targets.append(yb.detach().cpu().numpy())
 
-    preds_arr = np.concatenate(preds, axis=0) * y_std + y_mean
-    targets_arr = np.concatenate(targets, axis=0) * y_std + y_mean
+    preds_arr = denormalize(np.concatenate(preds, axis=0), y_mean, y_std)
+    targets_arr = denormalize(np.concatenate(targets, axis=0), y_mean, y_std)
 
     preds_norm_arr = np.concatenate(preds_norm, axis=0)
     targets_norm_arr = np.concatenate(targets_norm, axis=0)
 
-    mse_norm = mean_squared_error(targets_norm_arr, preds_norm_arr)
-    mae_norm = mean_absolute_error(targets_norm_arr, preds_norm_arr)
-    rmse_norm = float(np.sqrt(mse_norm))
+    metrics = compute_metrics(targets_arr, preds_arr)
+    norm_metrics = compute_metrics(targets_norm_arr, preds_norm_arr)
 
-    mse = mean_squared_error(targets_arr, preds_arr)
-    return {
+    metrics.update({
         "loss": total_loss / len(loader.dataset),
-        "mae": float(mean_absolute_error(targets_arr, preds_arr)),
-        "rmse": float(np.sqrt(mse)),
-        "r2": float(r2_score(targets_arr, preds_arr)),
-        "mae_norm": float(mae_norm),
-        "rmse_norm": float(rmse_norm),
+        "mae_norm": norm_metrics["mae"],
+        "rmse_norm": norm_metrics["rmse"],
         "preds": preds_arr,
         "targets": targets_arr,
-    }
+    })
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +104,7 @@ def train_pipeline(
     early_stop_patience: int,
     early_stop_min_delta: float,
     run_dir: str | None = None,
-    forecast_file_name: str = "future_24h_predictions.csv",
+    forecast_file_name: str = "future_mamba_predictions.csv",
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     """Train Mamba sequence model và trả về (summary, history_df, future_df)."""
     np.random.seed(seed)
@@ -235,7 +235,8 @@ def train_pipeline(
             loc_batch = loc_batch.to(device, non_blocking=pin_memory)
             yb = yb.to(device, non_blocking=pin_memory)
 
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            amp_context = torch.autocast(device_type=device.type, dtype=torch.float16) if amp_enabled else nullcontext()
+            with amp_context:
                 out = model(xb, loc_batch)
                 loss = criterion(out, yb)
 
@@ -417,7 +418,8 @@ def train_pipeline(
         if infer_x:
             x_all = torch.from_numpy(np.stack(infer_x, axis=0)).to(device, non_blocking=pin_memory)
             loc_all = torch.tensor(infer_loc, dtype=torch.long, device=device)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            amp_context = torch.autocast(device_type=device.type, dtype=torch.float16) if amp_enabled else nullcontext()
+            with amp_context:
                 pred_norm_all = model(x_all, loc_all).detach().float().cpu().numpy()
 
             pred_all = pred_norm_all * y_std + y_mean
@@ -446,7 +448,7 @@ def train_pipeline(
         out_dir = run_dir
     os.makedirs(out_dir, exist_ok=True)
 
-    model_path = os.path.join(out_dir, "best_mamba.pt")
+    model_path = os.path.join(out_dir, "best_mamba_aqi.pt")
     metrics_path = os.path.join(out_dir, "metrics_history.csv")
     future_pred_path = os.path.join(out_dir, forecast_file_name)
 
@@ -472,6 +474,8 @@ def train_pipeline(
         "encoded_features": ts_feature_cols,
         "val_loss": val_metrics["loss"],
         "val_r2": val_metrics["r2"],
+        "val_mae": val_metrics.get("mae"),
+        "val_rmse": val_metrics.get("rmse"),
         "val_mae_norm": val_metrics.get("mae_norm"),
         "val_rmse_norm": val_metrics.get("rmse_norm"),
         "test_loss": test_metrics["loss"],
@@ -497,3 +501,301 @@ def train_pipeline(
     }
 
     return summary, pd.DataFrame(history), future_out
+
+
+def predict_with_saved_model(
+    df: pd.DataFrame,
+    forecast_base_df: pd.DataFrame | None,
+    selected_locations: list[str],
+    target_col: str,
+    feature_cols: list[str],
+    window_size: int,
+    horizon: int,
+    sample_stride: int,
+    loss_name: str,
+    batch_size: int,
+    use_gpu: bool,
+    checkpoint_path: str,
+    run_dir: str | None = None,
+    forecast_file_name: str = "future_mamba_predictions.csv",
+) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    """Load checkpoint da train va forecast, khong train lai model."""
+    start_all = time.time()
+    selected_locations = normalize_locations(selected_locations)
+    if not selected_locations:
+        raise ValueError("Can chon it nhat 1 location de du doan Mamba.")
+
+    ckpt_path = os.path.abspath(os.path.expanduser(checkpoint_path))
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Khong tim thay checkpoint: {ckpt_path}")
+
+    state = torch.load(ckpt_path, map_location="cpu")
+    inferred_d_model = int(state["input_proj.weight"].shape[0])
+    inferred_horizon = int(state["head.2.weight"].shape[0])
+    inferred_layers = [
+        int(key.split(".")[1])
+        for key in state
+        if key.startswith("layers.") and key.split(".")[1].isdigit()
+    ]
+    inferred_n_layers = max(inferred_layers) + 1 if inferred_layers else 2
+    inferred_num_locations = int(state["location_emb.weight"].shape[0])
+    loc_embed_dim = int(state["location_emb.weight"].shape[1])
+    inferred_num_features = int(state["input_proj.weight"].shape[1]) - loc_embed_dim
+
+    d_model = inferred_d_model
+    horizon = inferred_horizon
+    n_layers = inferred_n_layers
+
+    work_df = df.copy()
+    if "location_key" not in work_df.columns or ("Time" not in work_df.columns and "ts_utc" not in work_df.columns):
+        raise ValueError("Dataset can co cot 'location_key' va 'Time' (hoac 'ts_utc').")
+
+    work_df = work_df.loc[
+        work_df["location_key"].astype(str).isin([str(x) for x in selected_locations])
+    ].copy()
+    if work_df.empty:
+        raise ValueError("Khong co du lieu cho cac location da chon.")
+
+    mod = load_train_module()
+    if mod is None or not hasattr(mod, "build_time_series_samples"):
+        raise RuntimeError("Khong load duoc helper build_time_series_samples tu mamba/train_mamba_aqi.py.")
+
+    x_seq, loc_ids, y, y_ts, num_locations, ts_feature_cols = mod.build_time_series_samples(
+        df=work_df,
+        target_col=target_col,
+        window_size=window_size,
+        horizon=horizon,
+        sample_stride=sample_stride,
+        feature_cols=feature_cols,
+        include_target_history=True,
+    )
+
+    train_split, val_split, test_split = mod.split_data_by_timeline(x_seq, loc_ids, y, y_ts)
+
+    if train_split.x_seq.shape[-1] != inferred_num_features:
+        raise ValueError(
+            "So luong feature trong UI/dataset khong khop checkpoint: "
+            f"dataset co {train_split.x_seq.shape[-1]}, checkpoint can {inferred_num_features}. "
+            "Hay chon dung cac input feature columns nhu luc train."
+        )
+    if num_locations != inferred_num_locations:
+        raise ValueError(
+            "So luong location khong khop checkpoint: "
+            f"dataset dang chon {num_locations}, checkpoint can {inferred_num_locations}. "
+            "Hay chon dung location da dung khi train."
+        )
+
+    x_mean = train_split.x_seq.mean(axis=(0, 1), keepdims=True)
+    x_std = train_split.x_seq.std(axis=(0, 1), keepdims=True)
+    x_std = np.where(x_std < 1e-6, 1.0, x_std)
+    for s in [train_split, val_split, test_split]:
+        s.x_seq = (s.x_seq - x_mean) / x_std
+
+    y_mean = float(train_split.y.mean())
+    y_std = float(train_split.y.std())
+    if y_std < 1e-6:
+        y_std = 1.0
+    for s in [train_split, val_split, test_split]:
+        s.y = (s.y - y_mean) / y_std
+
+    val_ds = mod.AQIDataset(val_split)
+    test_ds = mod.AQIDataset(test_split)
+
+    device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
+    pin_memory = device.type == "cuda"
+    amp_enabled = device.type == "cuda"
+
+    loader_kwargs: dict = {"batch_size": batch_size, "num_workers": 0, "pin_memory": pin_memory}
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
+
+    model = mod.TimeSeriesMambaRegressor(
+        num_features=train_split.x_seq.shape[-1],
+        num_locations=num_locations,
+        d_model=d_model,
+        n_layers=n_layers,
+        horizon=horizon,
+    ).to(device)
+
+    model.load_state_dict(state)
+    model.eval()
+
+    criterion = nn.HuberLoss(delta=1.0) if loss_name == "huber" else nn.MSELoss()
+    eval_start = time.time()
+    val_metrics = evaluate(model, val_loader, criterion, device, y_mean, y_std)
+    test_metrics = evaluate(model, test_loader, criterion, device, y_mean, y_std)
+    eval_sec = time.time() - eval_start
+
+    cleaned = work_df.copy()
+    ts_col = "Time" if "Time" in cleaned.columns else "ts_utc"
+    cleaned["_ts"] = pd.to_datetime(cleaned[ts_col], utc=True, errors="coerce")
+    cleaned = cleaned.dropna(subset=["_ts", "location_key", target_col]).copy()
+    cleaned["_loc_id"] = cleaned["location_key"].astype("category").cat.codes.astype(np.int64)
+    loc_to_id = (
+        cleaned.assign(_loc_key_str=cleaned["location_key"].astype(str))
+        .drop_duplicates(subset=["_loc_key_str"])
+        .set_index("_loc_key_str")["_loc_id"]
+        .to_dict()
+    )
+
+    base_df = forecast_base_df if forecast_base_df is not None else cleaned.copy()
+    if not isinstance(base_df, pd.DataFrame) or base_df.empty:
+        raise ValueError("Khong co du lieu moc de du bao.")
+
+    base_df = base_df.loc[
+        base_df["location_key"].astype(str).isin(list(loc_to_id.keys()))
+    ].copy()
+    if base_df.empty:
+        raise ValueError("Du lieu forecast khong co location trung voi model.")
+
+    base_col_map = {c.lower(): c for c in base_df.columns}
+    base_ts_col = base_col_map.get("ts_utc") or base_col_map.get("time") or base_col_map.get("timestamp") or "_ts"
+    if base_ts_col not in base_df.columns:
+        raise ValueError("Can co cot timestamp ('ts_utc', 'Time', hoac 'timestamp') de du bao.")
+    if base_ts_col != "ts_utc":
+        base_df["ts_utc"] = base_df[base_ts_col]
+
+    for col in ts_feature_cols:
+        if col not in base_df.columns:
+            base_df[col] = np.nan
+        base_df[col] = pd.to_numeric(base_df[col], errors="coerce")
+        fill_val = base_df[col].median()
+        if pd.isna(fill_val):
+            fill_val = 0.0
+        base_df[col] = base_df[col].fillna(fill_val)
+
+    future_df = build_future_24h_frame(
+        base_df,
+        feature_cols=ts_feature_cols,
+        target_col=target_col,
+        hours=horizon,
+    )
+    for col in ts_feature_cols:
+        future_df[col] = pd.to_numeric(future_df[col], errors="coerce")
+        fill_val = base_df[col].median() if col in base_df.columns else 0.0
+        if pd.isna(fill_val):
+            fill_val = 0.0
+        future_df[col] = future_df[col].fillna(fill_val)
+
+    forecast_start = time.time()
+    preds_rows: list[dict] = []
+    infer_x, infer_loc, infer_meta = [], [], []
+    x_mean_2d = x_mean.squeeze(0)
+    x_std_2d = x_std.squeeze(0)
+
+    with torch.inference_mode():
+        for loc in sorted(future_df["location_key"].astype(str).unique().tolist()):
+            if loc not in loc_to_id:
+                continue
+            loc_hist = (
+                base_df.loc[base_df["location_key"].astype(str) == loc]
+                .copy()
+                .assign(ts_utc=lambda d: pd.to_datetime(d["ts_utc"], utc=True, errors="coerce"))
+                .dropna(subset=["ts_utc"])
+                .sort_values("ts_utc")
+            )
+            if len(loc_hist) < window_size:
+                continue
+
+            rolling_window = loc_hist[ts_feature_cols].tail(window_size).to_numpy(dtype=np.float32)
+            loc_future = (
+                future_df.loc[future_df["location_key"].astype(str) == loc]
+                .copy()
+                .assign(ts_utc=lambda d: pd.to_datetime(d["ts_utc"], utc=True, errors="coerce"))
+                .sort_values("ts_utc")
+            )
+
+            for _, row in loc_future.iterrows():
+                x_norm = (rolling_window - x_mean_2d) / x_std_2d
+                infer_x.append(x_norm.astype(np.float32, copy=False))
+                infer_loc.append(int(loc_to_id[loc]))
+                infer_meta.append((row["ts_utc"], loc))
+                next_feats = row[ts_feature_cols].to_numpy(dtype=np.float32).reshape(1, -1)
+                rolling_window = np.concatenate([rolling_window[1:], next_feats], axis=0)
+
+        if infer_x:
+            x_all = torch.from_numpy(np.stack(infer_x, axis=0)).to(device, non_blocking=pin_memory)
+            loc_all = torch.tensor(infer_loc, dtype=torch.long, device=device)
+            amp_context = torch.autocast(device_type=device.type, dtype=torch.float16) if amp_enabled else nullcontext()
+            with amp_context:
+                pred_norm_all = model(x_all, loc_all).detach().float().cpu().numpy()
+
+            pred_all = pred_norm_all * y_std + y_mean
+            for (ts_val, loc_val), pred_val in zip(infer_meta, pred_all):
+                pred_scalar = float(np.asarray(pred_val, dtype=np.float32).reshape(-1)[0])
+                preds_rows.append({"time": ts_val, "location": loc_val, "predicted": pred_scalar})
+
+    forecast_sec = time.time() - forecast_start
+
+    if not preds_rows:
+        raise RuntimeError("Khong tao duoc du bao tu checkpoint da train.")
+
+    future_out = (
+        pd.DataFrame(preds_rows)
+        .assign(time=lambda d: format_time_utc_strings(d["time"]))
+        [["time", "location", "predicted"]]
+        .sort_values(["location", "time"])
+        .reset_index(drop=True)
+    )
+
+    if run_dir is None:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = os.path.join("outputs", "streamlit_saved_model_runs", run_id)
+    else:
+        out_dir = run_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    metrics_path = os.path.join(out_dir, "loaded_model_metrics.csv")
+    future_pred_path = os.path.join(out_dir, forecast_file_name)
+    io_start = time.time()
+    hist_df = pd.read_csv(os.path.join(os.path.dirname(ckpt_path), "metrics_history.csv")) if os.path.exists(os.path.join(os.path.dirname(ckpt_path), "metrics_history.csv")) else pd.DataFrame()
+    pd.DataFrame([{"split": "val", **val_metrics}, {"split": "test", **test_metrics}]).drop(
+        columns=["preds", "targets"], errors="ignore"
+    ).to_csv(metrics_path, index=False)
+    future_out.to_csv(future_pred_path, index=False)
+    io_sec = time.time() - io_start
+
+    summary = {
+        "mode": "loaded_checkpoint",
+        "device": str(device),
+        "torch_compile": False,
+        "num_workers": 0,
+        "pin_memory": bool(pin_memory),
+        "persistent_workers": False,
+        "grad_accum_steps": 0,
+        "n_rows_used": len(y),
+        "split_train": len(train_split.y),
+        "split_val": len(val_split.y),
+        "split_test": len(test_split.y),
+        "feature_count_after_encode": train_split.x_seq.shape[-1],
+        "sample_stride": int(sample_stride),
+        "encoded_features": ts_feature_cols,
+        "val_loss": val_metrics["loss"],
+        "val_r2": val_metrics["r2"],
+        "val_mae": val_metrics.get("mae"),
+        "val_rmse": val_metrics.get("rmse"),
+        "val_mae_norm": val_metrics.get("mae_norm"),
+        "val_rmse_norm": val_metrics.get("rmse_norm"),
+        "test_loss": test_metrics["loss"],
+        "test_mae": test_metrics["mae"],
+        "test_rmse": test_metrics["rmse"],
+        "test_r2": test_metrics["r2"],
+        "test_mae_norm": test_metrics.get("mae_norm"),
+        "test_rmse_norm": test_metrics.get("rmse_norm"),
+        "model_path": ckpt_path,
+        "metrics_path": metrics_path,
+        "future_pred_path": future_pred_path,
+        "future_rows": len(future_out),
+        "future_locations": int(future_out["location"].nunique()),
+        "per_location_files": [],
+        "epochs_ran": 0,
+        "stopped_early": False,
+        "best_val_loss": float(val_metrics["loss"]),
+        "train_only_sec": 0.0,
+        "eval_sec": float(eval_sec),
+        "forecast_sec": float(forecast_sec),
+        "io_sec": float(io_sec),
+        "run_sec": time.time() - start_all,
+    }
+
+    return summary, hist_df, future_out
