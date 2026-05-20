@@ -17,13 +17,12 @@ wsl --install -d Ubuntu
 cd ~
 
 # Xoa moi truong cu neu bi loi
-rm -rf mamba_env
+#rm -rf mamba_env
 
 # Tao moi truong ao (ep Python 3.10)
-python3.10 -m venv mamba_env
-
+python3.10 -m venv /mnt/d/mamba_env_tt
 # Kich hoat moi truong ao
-source mamba_env/bin/activate
+source /mnt/d/mamba_env_tt/bin/activate
 ```
 
 ## 3) Chuyen den thu muc du an
@@ -76,24 +75,14 @@ wsl --set-default Ubuntu
 /mnt/d/KLTN/TS_MAMBA/
 ```
 
+## 8) Cai requirements va chay train
 
-source mamba_env/bin/activate
+```bash
+source /mnt/d/mamba_env_tt/bin/activate
 cd /mnt/d/KLTN/TS_MAMBA
-./lnx_venv/bin/python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
-NẾu lỗi thì gỡ torch cũ
-
-./lnx_venv/bin/python -m pip show torch #( xem đường dẫn)
-
-#nhớ xóa đúng đường dẫn
-rm -rf /mnt/d/KLTN/TS_MAMBA/lnx_venv/lib/python3.14/site-packages/torch*
-rm -rf /mnt/d/KLTN/TS_MAMBA/lnx_venv/lib/python3.14/site-packages/*torch*
-
-cài lại
-./lnx_venv/bin/python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-
-chạy 
-./lnx_venv/bin/python mamba/train_mamba_aqi.py \
+python mamba/train_mamba_aqi.py \
   --data-path dataset/air_quality.csv \
   --epochs 10 \
   --window-size 72 \
@@ -101,3 +90,16 @@ chạy
   --batch-size 128 \
   --device cuda \
   --amp
+```
+
+## 9) Neu loi torch
+
+```bash
+python -m pip show torch  # xem location
+
+# nho xoa dung duong dan
+# rm -rf /path/to/site-packages/torch*
+# rm -rf /path/to/site-packages/*torch*
+
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
