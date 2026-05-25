@@ -3,45 +3,65 @@ run:
   models: ["mamba", "lstm", "itransformer"]
   output_root: runs
 
-common:
+data:
   data_path: dataset/air_quality.csv
   target_col: aqi
   locations: []
-  epochs: 10
-  batch_size: 32
-  window_size: 72
-  horizon: 12
-  lr: 0.001
-  loss: huber
-  seed: 42
-  num_workers: 0
-  d_model: 64
-  n_layers: 2
 
 mamba:
   enabled: true
+  epochs: 150
+  batch_size: 32
+  window_size: 96
+  horizon: 12
+  lr: 0.00015
+  loss: huber
+  seed: 42
+  num_workers: 0
+  d_model: 96
+  n_layers: 2
   device: cuda
   amp: true
-  sample_stride: 4
-  weight_decay: 0.0001
+  sample_stride: 1
+  weight_decay: 0.0015
   grad_accum_steps: 1
-  max_grad_norm: 1.0
-  patience: 5
-  min_delta: 0.0
+  max_grad_norm: 0.5
+  patience: 20
+  min_delta: 0.00001
   forecast_24h: false
   forecast_base: null
   forecast_out: null
 
 lstm:
   enabled: true
+  epochs: 150
+  batch_size: 32
+  window_size: 96
+  horizon: 12
+  lr: 0.0001
+  loss: huber
+  seed: 42
+  num_workers: 0
+  d_model: 64
+  n_layers: 2
   embed_dim: 16
-  early_stop_patience: 3
+  early_stop_patience: 20
   overfit_threshold: 0.05
   predict: false
   output_csv: null
 
 itransformer:
   enabled: true
+  epochs: 150
+  batch_size: 32
+  window_size: 96
+  horizon: 12
+  lr: 0.0001
+  loss: huber
+  seed: 42
+  num_workers: 0
+  d_model: 64
+  n_layers: 2
   device: cuda
   gpu: 0
   model_id: air_quality_AQI
@@ -59,7 +79,7 @@ itransformer:
   dropout: 0.1
   embed: timeF
   activation: gelu
-  patience: 3
+  patience: 20
   des: Exp
   inverse: true
   use_amp: false

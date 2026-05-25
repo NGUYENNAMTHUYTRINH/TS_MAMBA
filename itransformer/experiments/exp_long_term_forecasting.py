@@ -41,8 +41,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        criterion = nn.MSELoss()
-        return criterion
+        loss_name = str(getattr(self.args, 'loss', 'MSE')).lower()
+        if loss_name == 'huber':
+            return nn.SmoothL1Loss()
+        return nn.MSELoss()
 
     def vali(self, vali_data, vali_loader, criterion, return_metrics=False):
         total_loss = []
@@ -101,7 +103,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
-        test_data, test_loader = self._get_data(flag='test')
 
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
@@ -187,16 +188,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             train_loss = np.average(train_loss)
             vali_metrics = self.vali(vali_data, vali_loader, criterion, return_metrics=True)
             vali_loss = vali_metrics["loss"]
-            test_loss = self.vali(test_data, test_loader, criterion)
 
-            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
-                epoch + 1, train_steps, train_loss, vali_loss, test_loss))
+            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f}".format(
+                epoch + 1, train_steps, train_loss, vali_loss))
             history.append({
                 'epoch': epoch + 1,
                 'train_loss': float(train_loss),
                 'val_loss': float(vali_loss),
                 'mae': float(vali_metrics['mae']),
                 'rmse': float(vali_metrics['rmse']),
+                'val_mae_norm': float(vali_metrics['mae']),
+                'val_rmse_norm': float(vali_metrics['rmse']),
                 'val_r2': float(vali_metrics['r2']),
                 'train_sec': float(epoch_sec),
             })
@@ -218,15 +220,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
+        artifact_root = os.path.dirname(os.path.abspath(self.args.checkpoints))
         if test:
             print('loading model')
-            self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
+            self.model.load_state_dict(torch.load(os.path.join(self.args.checkpoints, setting, 'checkpoint.pth')))
 
         preds = []
         trues = []
-        folder_path = './test_results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
 
         self.model.eval()
         with torch.no_grad():
@@ -270,20 +270,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 pred = outputs
                 true = batch_y
-
                 preds.append(pred)
                 trues.append(true)
-                if i % 20 == 0:
-                    input = batch_x.detach().cpu().numpy()
-                    if test_data.scale and self.args.inverse:
-                        shape = input.shape
-                        if hasattr(test_data, 'inverse_transform_x'):
-                            input = test_data.inverse_transform_x(input.squeeze(0)).reshape(shape)
-                        else:
-                            input = test_data.inverse_transform(input.squeeze(0)).reshape(shape)
-                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
-                    pred_curve = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
-                    visual(gt, pred_curve, os.path.join(folder_path, str(i) + '.pdf'))
 
         preds = np.array(preds)
         trues = np.array(trues)
@@ -293,7 +281,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         print('test shape:', preds.shape, trues.shape)
 
         # result save
-        folder_path = './results/' + setting + '/'
+        folder_path = artifact_root + os.sep
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
@@ -391,21 +379,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             print(future_df.to_string(index=False))
             print(f'Saved future forecast table to: {future_path}')
 
-        f = open("result_long_term_forecast.txt", 'a')
-
-        f.write(setting + "  \n")
-
-        f.write(
-            'mae:{:.6f}, mse:{:.6f}, rmse:{:.6f}, mape:{:.6f}, mspe:{:.6f}, r2:{:.6f}'
-            .format(mae, mse, rmse, mape, mspe, r2)
-        )
-
-        f.write('\n\n\n')
-        f.close()
-
-        np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe,r2]))
-        np.save(folder_path + 'pred.npy', preds)
-        np.save(folder_path + 'true.npy', trues)
+        np.save(os.path.join(folder_path, 'metrics.npy'), np.array([mae, mse, rmse, mape, mspe, r2]))
+        np.save(os.path.join(folder_path, 'pred.npy'), preds)
+        np.save(os.path.join(folder_path, 'true.npy'), trues)
 
         return
 
@@ -453,10 +429,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
 
         # result save
-        folder_path = './results/' + setting + '/'
+        artifact_root = os.path.dirname(os.path.abspath(self.args.checkpoints))
+        folder_path = artifact_root + os.sep
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
-        np.save(folder_path + 'real_prediction.npy', preds)
+        np.save(os.path.join(folder_path, 'real_prediction.npy'), preds)
 
         return

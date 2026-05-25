@@ -128,7 +128,7 @@ def render_location_selector(df: pd.DataFrame) -> list[str]:
     locations = sorted(df["location_key"].dropna().astype(str).unique().tolist()) if "location_key" in df.columns else []
     st.subheader("Chon dia diem")
     selected_locations = st.multiselect(
-        "Chon dia diem de du doan hoac train lai",
+        "Chon dia diem de du doan",
         options=locations,
         default=locations[: min(3, len(locations))],
         help="Khi predict bang checkpoint, hay chon dung location da dung luc train. iTransformer hien chay 1 location moi lan.",
@@ -198,7 +198,7 @@ def _render_sample_count_preview(
 
 
 def render_train_config() -> dict:
-    """Render model/training config. These values are used for both predict and retrain."""
+    """Render inference config used when evaluating saved checkpoints."""
     df = st.session_state.get("df", pd.DataFrame())
     all_cols = df.columns.tolist()
     blocked_lower = {"ts_utc", "time", "timestamp", "location_key"}
@@ -210,7 +210,7 @@ def render_train_config() -> dict:
         and c not in {"y_true", "y_pred", "abs_error"}
     ]
 
-    st.subheader("Cau hinh model")
+    st.subheader("Cau hinh du doan")
     conf1, conf2, conf3 = st.columns(3)
 
     with conf1:
@@ -229,24 +229,15 @@ def render_train_config() -> dict:
         st.session_state["train_window_size"] = int(window_size)
         st.session_state["train_horizon"] = int(horizon)
         st.session_state["train_sample_stride"] = int(sample_stride)
-        epochs = st.number_input("Epochs", min_value=1, max_value=200, value=50, step=1)
-        early_stop_patience = st.number_input("Early stop patience", min_value=0, max_value=50, value=5, step=1)
         batch_size = st.number_input("Batch size", min_value=8, max_value=8192, value=128, step=8)
-        lr = st.number_input("Learning rate", min_value=1e-6, max_value=1e-1, value=3e-4, format="%.6f")
-        weight_decay = st.number_input("Weight decay", min_value=0.0, max_value=1.0, value=1e-4, format="%.6f")
 
     with conf3:
-        d_model = st.number_input("d_model", min_value=16, max_value=512, value=64, step=16)
-        n_layers = st.number_input("n_layers", min_value=1, max_value=8, value=2, step=1)
-        grad_accum_steps = st.number_input("Gradient accumulation", min_value=1, max_value=64, value=1, step=1)
-        max_grad_norm = st.number_input("Max grad norm", min_value=0.0, max_value=100.0, value=1.0, step=0.5)
-        seed = st.number_input("Seed", min_value=0, max_value=999999, value=42, step=1)
         use_gpu = st.checkbox("Dung GPU neu co", value=True)
 
     import torch
 
     if use_gpu and not torch.cuda.is_available():
-        st.warning("PyTorch hien khong nhan CUDA. Predict/train se chay bang CPU.")
+        st.warning("PyTorch hien khong nhan CUDA. Predict se chay bang CPU.")
 
     return {
         "target_col": target_col,
@@ -255,16 +246,7 @@ def render_train_config() -> dict:
         "window_size": int(window_size),
         "horizon": int(horizon),
         "sample_stride": int(sample_stride),
-        "epochs": int(epochs),
-        "early_stop_patience": int(early_stop_patience),
         "batch_size": int(batch_size),
-        "lr": float(lr),
-        "weight_decay": float(weight_decay),
-        "d_model": int(d_model),
-        "n_layers": int(n_layers),
-        "grad_accum_steps": int(grad_accum_steps),
-        "max_grad_norm": float(max_grad_norm),
-        "seed": int(seed),
         "use_gpu": bool(use_gpu),
     }
 
@@ -280,8 +262,8 @@ def render_model_results(
         st.success("Train/Test hoan tat")
 
     met1, met2, met3, met4 = st.columns(4)
-    met1.metric("Test MAE", _fmt_metric(summary.get("test_mae")))
-    met2.metric("Test RMSE", _fmt_metric(summary.get("test_rmse")))
+    met1.metric("Test MAE Norm", _fmt_metric(summary.get("test_mae_norm")))
+    met2.metric("Test RMSE Norm", _fmt_metric(summary.get("test_rmse_norm")))
     met3.metric("Test R2", _fmt_metric(summary.get("test_r2")))
     met4.metric("Locations done", f"{int(summary['future_locations']):,}")
 
@@ -300,6 +282,8 @@ def render_model_results(
         "test_mae": summary.get("test_mae"),
         "test_rmse": summary.get("test_rmse"),
         "test_r2": summary.get("test_r2"),
+        "test_mae_norm": summary.get("test_mae_norm"),
+        "test_rmse_norm": summary.get("test_rmse_norm"),
         "val_mae_norm": summary.get("val_mae_norm"),
         "val_rmse_norm": summary.get("val_rmse_norm"),
         "train_only_sec": round(float(summary.get("train_only_sec", 0.0)), 2),
@@ -332,5 +316,5 @@ def render_forecast_download(future_df: pd.DataFrame, summary: dict, key_prefix:
         mime="text/csv",
         key=f"{key_prefix}_download_predictions",
     )
-    st.info("File nay duoc tao tu lan predict/train vua chay tren Streamlit, khong phai doc lai future_*.csv co san.")
+    st.info("File nay duoc tao tu lan predict vua chay tren Streamlit, khong phai doc lai future_*.csv co san.")
     st.code(f"run_dir: {os.path.dirname(summary['future_pred_path'])}\nFiles: {download_name}")

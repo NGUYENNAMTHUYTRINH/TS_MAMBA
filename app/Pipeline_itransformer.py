@@ -15,10 +15,10 @@ import argparse
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -27,8 +27,10 @@ import torch
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 ITRANSFORMER_ROOT = APP_ROOT / "itransformer"
-if str(APP_ROOT) not in sys.path:
-    sys.path.insert(0, str(APP_ROOT))
+for path in [APP_ROOT, ITRANSFORMER_ROOT]:
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 from core.metrics import compute_metrics
 from Utils import get_timestamp_col, normalize_locations, write_json
@@ -179,73 +181,188 @@ def _run_itransformer(cmd: list[str]) -> None:
     subprocess.run(cmd, cwd=ITRANSFORMER_ROOT, check=True)
 
 
-def _results_dir(setting: str) -> Path:
-    return ITRANSFORMER_ROOT / "results" / setting
+def _cleanup_legacy_outputs(setting: str) -> None:
+    for path in [
+        ITRANSFORMER_ROOT / "results" / setting,
+        ITRANSFORMER_ROOT / "test_results" / setting,
+        ITRANSFORMER_ROOT / "checkpoints" / setting,
+    ]:
+        if path.exists():
+            shutil.rmtree(path)
 
-
-def _copy_result_files(setting: str, run_dir: Path) -> None:
-    src = _results_dir(setting)
-    if not src.exists():
-        return
-    dst = run_dir / "itransformer_results"
-    if dst.exists():
-        shutil.rmtree(dst)
-    shutil.copytree(src, dst)
+    legacy_log = ITRANSFORMER_ROOT / "result_long_term_forecast.txt"
+    if legacy_log.exists():
+        legacy_log.unlink()
 
 
 def _empty_metrics() -> dict[str, float]:
     return {"mae": np.nan, "mse": np.nan, "rmse": np.nan, "r2": np.nan}
 
 
-def _metrics_from_history(hist_df: pd.DataFrame) -> dict[str, float]:
+def _str_to_bool(value: str) -> bool:
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y"}:
+        return True
+    if lowered in {"0", "false", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Gia tri boolean khong hop le: {value}")
+
+
+def _best_val_metrics_from_history(hist_df: pd.DataFrame) -> dict[str, float]:
     if hist_df is None or hist_df.empty or "val_loss" not in hist_df.columns:
         return {}
     best_idx = pd.to_numeric(hist_df["val_loss"], errors="coerce").idxmin()
     row = hist_df.loc[best_idx]
-    val_loss = float(row.get("val_loss", np.nan))
     return {
-        "mode": "train_loss_only",
         "best_epoch": int(row.get("epoch", 0)),
-        "best_val_loss": val_loss,
-        "mse": val_loss,
+        "loss": float(row.get("val_loss", np.nan)),
         "mae": float(row.get("mae", np.nan)),
         "rmse": float(row.get("rmse", np.nan)),
+        "mae_norm": float(row.get("val_mae_norm", row.get("mae", np.nan))),
+        "rmse_norm": float(row.get("val_rmse_norm", row.get("rmse", np.nan))),
         "r2": float(row.get("val_r2", np.nan)),
     }
 
 
-def _compute_metrics_from_results(setting: str) -> dict[str, float]:
-    result_dir = _results_dir(setting)
-    pred_path = result_dir / "pred.npy"
-    true_path = result_dir / "true.npy"
-    if not pred_path.exists() or not true_path.exists():
-        return _empty_metrics()
-    preds = np.load(pred_path)
-    trues = np.load(true_path)
-    return compute_metrics(trues, preds)
+def _args_from_config(config: dict[str, Any], root_path: Path, use_gpu: bool) -> SimpleNamespace:
+    args = dict(config)
+    if args.get("data") == "air_quality":
+        air_quality_dim = len(AIR_QUALITY_FEATURE_COLS)
+        features = args.get("features", "MS")
+        if features == "S":
+            args["enc_in"] = 1
+            args["dec_in"] = 1
+            args["c_out"] = 1
+        elif features == "MS":
+            args["enc_in"] = air_quality_dim
+            args["dec_in"] = 1
+            args["c_out"] = 1
+        elif features == "M":
+            args["enc_in"] = air_quality_dim
+            args["dec_in"] = air_quality_dim
+            args["c_out"] = air_quality_dim
+    args.update({
+        "root_path": str(root_path),
+        "data_path": "air_quality.csv",
+        "checkpoints": str(root_path / "checkpoints"),
+        "use_gpu": bool(use_gpu and torch.cuda.is_available()),
+        "use_multi_gpu": False,
+        "devices": "0",
+        "device_ids": [0],
+        "output_attention": False,
+        "do_predict": False,
+        "skip_test": False,
+        "moving_avg": 25,
+        "exp_name": "MTSF",
+        "channel_independence": False,
+        "class_strategy": "projection",
+        "use_norm": 1,
+        "target_root_path": str(root_path),
+        "target_data_path": "air_quality.csv",
+        "efficient_training": False,
+        "partial_start_index": 0,
+        "lradj": "type1",
+        "itr": 1,
+    })
+    if not args["use_gpu"]:
+        args["gpu"] = 0
+    return SimpleNamespace(**args)
 
 
-def _load_future(setting: str, target_col: str, location: str) -> pd.DataFrame:
-    future_path = _results_dir(setting) / "future_forecast.csv"
-    if not future_path.exists():
-        raise RuntimeError("Khong tim thay future_forecast.csv cua iTransformer.")
-    future = pd.read_csv(future_path)
-    pred_col = f"forecast_{target_col}"
-    if pred_col not in future.columns:
-        pred_cols = [c for c in future.columns if c.startswith("forecast_")]
-        if not pred_cols:
-            raise RuntimeError("future_forecast.csv khong co cot forecast_*.")
-        pred_col = pred_cols[0]
-    return (
-        future.assign(
-            time=lambda d: pd.to_datetime(d["forecast_time"], utc=True, errors="coerce")
-            .dt.strftime("%Y-%m-%d %H:%M:%S+00:00"),
-            location=str(location),
-            predicted=lambda d: pd.to_numeric(d[pred_col], errors="coerce"),
-        )[["time", "location", "predicted"]]
-        .dropna(subset=["time", "predicted"])
-        .reset_index(drop=True)
+def _direct_predict_itransformer(
+    *,
+    df: pd.DataFrame,
+    csv_path: Path,
+    config: dict[str, Any],
+    state: dict,
+    target_col: str,
+    location: str,
+    use_gpu: bool,
+) -> tuple[dict[str, float], pd.DataFrame, int, float, float]:
+    from experiments.exp_long_term_forecasting import Exp_Long_Term_Forecast
+
+    args = _args_from_config(config, csv_path.parent, use_gpu)
+    exp = Exp_Long_Term_Forecast(args)
+    exp.model.load_state_dict(state)
+    exp.model.eval()
+
+    test_data, test_loader = exp._get_data(flag="test")
+    preds, trues = [], []
+    preds_norm, trues_norm = [], []
+    eval_start = time.time()
+    with torch.no_grad():
+        for batch_x, batch_y, batch_x_mark, batch_y_mark in test_loader:
+            batch_x = batch_x.float().to(exp.device)
+            batch_y = batch_y.float().to(exp.device)
+            batch_x_mark = batch_x_mark.float().to(exp.device)
+            batch_y_mark = batch_y_mark.float().to(exp.device)
+            dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float()
+            dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(exp.device)
+            outputs = exp.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+            f_dim = -1 if args.features == "MS" else 0
+            outputs = outputs[:, -args.pred_len:, f_dim:]
+            batch_y = batch_y[:, -args.pred_len:, f_dim:].to(exp.device)
+            outputs_np = outputs.detach().cpu().numpy()
+            batch_y_np = batch_y.detach().cpu().numpy()
+            preds_norm.append(outputs_np.copy())
+            trues_norm.append(batch_y_np.copy())
+            if test_data.scale and args.inverse:
+                shape = outputs_np.shape
+                outputs_np = test_data.inverse_transform(outputs_np.squeeze(0)).reshape(shape)
+                batch_y_np = test_data.inverse_transform(batch_y_np.squeeze(0)).reshape(shape)
+            preds.append(outputs_np)
+            trues.append(batch_y_np)
+
+    eval_sec = time.time() - eval_start
+    metrics = _empty_metrics()
+    if preds and trues:
+        metrics = compute_metrics(
+            np.array(trues).reshape(-1, args.pred_len, np.array(trues).shape[-1]),
+            np.array(preds).reshape(-1, args.pred_len, np.array(preds).shape[-1]),
+        )
+    if preds_norm and trues_norm:
+        norm_metrics = compute_metrics(
+            np.array(trues_norm).reshape(-1, args.pred_len, np.array(trues_norm).shape[-1]),
+            np.array(preds_norm).reshape(-1, args.pred_len, np.array(preds_norm).shape[-1]),
+        )
+        metrics["mae_norm"] = norm_metrics["mae"]
+        metrics["rmse_norm"] = norm_metrics["rmse"]
+
+    forecast_start = time.time()
+    (
+        future_x,
+        future_label_y,
+        future_x_mark,
+        future_y_mark,
+        future_dates,
+    ) = test_data.get_future_forecast_sample()
+
+    future_x = torch.tensor(future_x).float().unsqueeze(0).to(exp.device)
+    future_label_y = torch.tensor(future_label_y).float().unsqueeze(0).to(exp.device)
+    future_x_mark = torch.tensor(future_x_mark).float().unsqueeze(0).to(exp.device)
+    future_y_mark = torch.tensor(future_y_mark).float().unsqueeze(0).to(exp.device)
+    future_dec_inp = torch.zeros(
+        (1, args.pred_len, future_label_y.shape[-1]),
+        dtype=future_label_y.dtype,
+        device=exp.device,
     )
+    future_dec_inp = torch.cat([future_label_y, future_dec_inp], dim=1)
+    with torch.no_grad():
+        future_outputs = exp.model(future_x, future_x_mark, future_dec_inp, future_y_mark)
+    f_dim = -1 if args.features == "MS" else 0
+    future_preds = future_outputs[:, -args.pred_len:, f_dim:].detach().cpu().numpy()
+    if test_data.scale and args.inverse:
+        shape = future_preds.shape
+        future_preds = test_data.inverse_transform(future_preds.squeeze(0)).reshape(shape)
+    future_preds = future_preds[0]
+    pred_values = future_preds[:, 0] if future_preds.ndim == 2 else future_preds.reshape(-1)
+    future_out = pd.DataFrame({
+        "time": pd.to_datetime(future_dates, utc=True).strftime("%Y-%m-%d %H:%M:%S+00:00"),
+        "location": str(location),
+        "predicted": pred_values.astype(float),
+    })
+    forecast_sec = time.time() - forecast_start
+    return metrics, future_out, len(test_data), eval_sec, forecast_sec
 
 
 def _history_from_log(run_dir: Path) -> pd.DataFrame:
@@ -274,15 +391,6 @@ def _save_bundle(
         },
         model_path,
     )
-    write_json(
-        run_dir / "itransformer_config.json",
-        {
-            "config": config,
-            "setting": setting,
-            "location": location,
-            "checkpoint_path": str(checkpoint_path),
-        },
-    )
     return model_path
 
 
@@ -301,7 +409,9 @@ def _summary(
     eval_sec: float,
     forecast_sec: float,
     encoded_features: list[str],
+    val_metrics: dict[str, float] | None = None,
 ) -> dict:
+    val_metrics = val_metrics or {}
     return {
         "mode": mode,
         "device": device,
@@ -312,18 +422,18 @@ def _summary(
         "feature_count_after_encode": len(encoded_features),
         "sample_stride": 1,
         "encoded_features": encoded_features,
-        "val_loss": metrics.get("best_val_loss", metrics.get("mse")),
-        "val_r2": metrics.get("r2"),
-        "val_mae": metrics.get("mae"),
-        "val_rmse": metrics.get("rmse"),
-        "val_mae_norm": metrics.get("mae"),
-        "val_rmse_norm": metrics.get("rmse"),
-        "test_loss": metrics.get("mse"),
+        "val_loss": val_metrics.get("loss", metrics.get("best_val_loss", metrics.get("mse"))),
+        "val_r2": val_metrics.get("r2", metrics.get("r2")),
+        "val_mae": val_metrics.get("mae", metrics.get("mae")),
+        "val_rmse": val_metrics.get("rmse", metrics.get("rmse")),
+        "val_mae_norm": val_metrics.get("mae_norm", val_metrics.get("mae", metrics.get("mae"))),
+        "val_rmse_norm": val_metrics.get("rmse_norm", val_metrics.get("rmse", metrics.get("rmse"))),
+        "test_loss": metrics.get("loss", metrics.get("mse")),
         "test_mae": metrics.get("mae"),
         "test_rmse": metrics.get("rmse"),
         "test_r2": metrics.get("r2"),
-        "test_mae_norm": np.nan,
-        "test_rmse_norm": np.nan,
+        "test_mae_norm": metrics.get("mae_norm"),
+        "test_rmse_norm": metrics.get("rmse_norm"),
         "model_path": str(model_path),
         "metrics_path": str(metrics_path),
         "future_pred_path": str(future_path) if future_path is not None else "",
@@ -351,25 +461,25 @@ def _config(
     use_gpu: bool,
     num_workers: int,
     early_stop_patience: int,
-    label_len: int | None = None,
-    n_heads: int = 8,
-    d_layers: int = 1,
-    d_ff: int | None = None,
-    factor: int = 1,
-    dropout: float = 0.1,
-    embed: str = "timeF",
-    activation: str = "gelu",
-    des: str = "Exp",
-    gpu: int = 0,
-    features: str = "MS",
-    model_id: str = "air_quality_AQI",
-    model: str = "Transformer",
-    freq: str = "h",
-    enc_in: int = 11,
-    dec_in: int = 11,
-    c_out: int = 1,
-    use_amp: bool = False,
-    inverse: bool = True,
+    label_len: int,
+    n_heads: int,
+    d_layers: int,
+    d_ff: int,
+    factor: int,
+    dropout: float,
+    embed: str,
+    activation: str,
+    des: str,
+    gpu: int,
+    features: str,
+    model_id: str,
+    model: str,
+    freq: str,
+    enc_in: int,
+    dec_in: int,
+    c_out: int,
+    use_amp: bool,
+    inverse: bool,
 ) -> dict[str, Any]:
     return {
         "model_id": model_id,
@@ -380,7 +490,7 @@ def _config(
         "target": target_col,
         "freq": freq,
         "seq_len": int(window_size),
-        "label_len": int(label_len or min(48, window_size)),
+        "label_len": int(label_len),
         "pred_len": int(horizon),
         "enc_in": int(enc_in),
         "dec_in": int(dec_in),
@@ -389,7 +499,7 @@ def _config(
         "n_heads": int(n_heads),
         "e_layers": int(n_layers),
         "d_layers": int(d_layers),
-        "d_ff": int(d_ff or max(d_model, 128)),
+        "d_ff": int(d_ff),
         "factor": int(factor),
         "distil": True,
         "dropout": float(dropout),
@@ -400,7 +510,7 @@ def _config(
         "batch_size": int(batch_size),
         "patience": int(early_stop_patience),
         "learning_rate": float(lr),
-        "loss": "MSE" if loss_name == "mse" else "MSE",
+        "loss": "Huber" if loss_name == "huber" else "MSE",
         "des": des,
         "gpu": int(gpu),
         "use_gpu": bool(use_gpu),
@@ -425,35 +535,34 @@ def train_itransformer_pipeline(
     seed: int,
     use_gpu: bool,
     early_stop_patience: int,
+    num_workers: int,
+    label_len: int,
+    n_heads: int,
+    d_layers: int,
+    d_ff: int,
+    factor: int,
+    dropout: float,
+    embed: str,
+    activation: str,
+    des: str,
+    gpu: int,
+    features: str,
+    model_id: str,
+    model: str,
+    freq: str,
+    enc_in: int,
+    dec_in: int,
+    c_out: int,
+    use_amp: bool,
+    inverse: bool,
     run_dir: str | None = None,
-    label_len: int | None = None,
-    n_heads: int = 8,
-    d_layers: int = 1,
-    d_ff: int | None = None,
-    factor: int = 1,
-    dropout: float = 0.1,
-    embed: str = "timeF",
-    activation: str = "gelu",
-    des: str = "Exp",
-    gpu: int = 0,
-    features: str = "MS",
-    model_id: str = "air_quality_AQI",
-    model: str = "Transformer",
-    freq: str = "h",
-    enc_in: int = 11,
-    dec_in: int = 11,
-    c_out: int = 1,
-    use_amp: bool = False,
-    inverse: bool = True,
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     del feature_cols, seed
     start = time.time()
     out_dir = Path(run_dir or APP_ROOT / "runs" / "itransformer" / datetime.now().strftime("%Y%m%d_%H%M%S"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    tmp_ctx = tempfile.TemporaryDirectory(prefix="itransformer_train_")
-    tmp_root = Path(tmp_ctx.name)
-    csv_path, location, rows_used = _prepare_itransformer_csv(df, selected_locations, target_col, tmp_root)
+    csv_path, location, rows_used = _prepare_itransformer_csv(df, selected_locations, target_col, out_dir)
     config = _config(
         target_col=target_col,
         window_size=window_size,
@@ -465,7 +574,7 @@ def train_itransformer_pipeline(
         n_layers=n_layers,
         loss_name=loss_name,
         use_gpu=use_gpu,
-        num_workers=0,
+        num_workers=num_workers,
         early_stop_patience=early_stop_patience,
         label_len=label_len,
         n_heads=n_heads,
@@ -488,46 +597,50 @@ def train_itransformer_pipeline(
         inverse=inverse,
     )
     setting = _setting_name(config)
-    checkpoints = tmp_root / "checkpoints"
+    checkpoints = out_dir / "checkpoints"
 
-    try:
-        train_start = time.time()
-        _run_itransformer(_build_cmd(config, 1, csv_path.parent, checkpoints, skip_test=True))
-        train_sec = time.time() - train_start
+    train_start = time.time()
+    _run_itransformer(_build_cmd(config, 1, csv_path.parent, checkpoints, skip_test=True))
+    train_sec = time.time() - train_start
 
-        checkpoint_path = checkpoints / setting / "checkpoint.pth"
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Khong tim thay checkpoint iTransformer: {checkpoint_path}")
-        model_path = _save_bundle(out_dir, checkpoint_path, config, setting, location)
-        tmp_history_path = tmp_root / "metrics_history.csv"
-        if tmp_history_path.exists():
-            shutil.copy2(tmp_history_path, out_dir / "metrics_history.csv")
-    finally:
-        tmp_ctx.cleanup()
+    checkpoint_path = checkpoints / setting / "checkpoint.pth"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Khong tim thay checkpoint iTransformer: {checkpoint_path}")
+    model_path = _save_bundle(out_dir, checkpoint_path, config, setting, location)
+    _cleanup_legacy_outputs(setting)
+    shutil.rmtree(checkpoints, ignore_errors=True)
+    shutil.rmtree(out_dir / "data", ignore_errors=True)
 
     hist_df = _history_from_log(out_dir)
-    metrics = _metrics_from_history(hist_df)
-    future_out = None
-    future_path = None
+    val_metrics = _best_val_metrics_from_history(hist_df)
     metrics_path = out_dir / "metrics.json"
-    write_json(metrics_path, metrics)
+    write_json(metrics_path, {
+        "best_epoch": val_metrics.get("best_epoch"),
+        "val_loss": val_metrics.get("loss"),
+        "val_mae": val_metrics.get("mae"),
+        "val_rmse": val_metrics.get("rmse"),
+        "val_mae_norm": val_metrics.get("mae_norm"),
+        "val_rmse_norm": val_metrics.get("rmse_norm"),
+        "val_r2": val_metrics.get("r2"),
+    })
 
     summary = _summary(
         mode="train_itransformer_only",
         device="cuda" if use_gpu and torch.cuda.is_available() else "cpu",
         rows_used=rows_used,
-        metrics=metrics,
+        metrics=val_metrics,
+        val_metrics=val_metrics,
         model_path=model_path,
         metrics_path=metrics_path,
-        future_path=future_path,
-        future_out=future_out,
+        future_path=None,
+        future_out=None,
         run_sec=time.time() - start,
         train_sec=train_sec,
         eval_sec=0.0,
         forecast_sec=0.0,
         encoded_features=AIR_QUALITY_FEATURE_COLS,
     )
-    return summary, hist_df, future_out
+    return summary, hist_df, None
 
 
 def predict_itransformer_with_saved_model(
@@ -561,22 +674,18 @@ def predict_itransformer_with_saved_model(
     out_dir = Path(run_dir or ckpt_path.parent)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    local_checkpoint_dir = ITRANSFORMER_ROOT / "checkpoints" / setting
-    local_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(bundle["model_state"], local_checkpoint_dir / "checkpoint.pth")
-
-    with tempfile.TemporaryDirectory(prefix="itransformer_predict_") as tmp_dir:
-        tmp_root = Path(tmp_dir)
-        csv_path, location, rows_used = _prepare_itransformer_csv(df, [location], target_col, tmp_root)
-        eval_start = time.time()
-        _run_itransformer(_build_cmd(config, 0, csv_path.parent, ITRANSFORMER_ROOT / "checkpoints"))
-        eval_sec = time.time() - eval_start
-    _copy_result_files(setting, out_dir)
-
-    metrics = _compute_metrics_from_results(setting)
-    forecast_start = time.time()
-    future_out = _load_future(setting, target_col, location)
-    forecast_sec = time.time() - forecast_start
+    csv_path, location, rows_used = _prepare_itransformer_csv(df, [location], target_col, out_dir)
+    metrics, future_out, rows_used, eval_sec, forecast_sec = _direct_predict_itransformer(
+        df=df,
+        csv_path=csv_path,
+        config=config,
+        state=bundle["model_state"],
+        target_col=target_col,
+        location=location,
+        use_gpu=use_gpu,
+    )
+    _cleanup_legacy_outputs(setting)
+    shutil.rmtree(out_dir / "data", ignore_errors=True)
 
     future_path = out_dir / "future_itransformer_predictions.csv"
     metrics_path = out_dir / "loaded_itransformer_metrics.json"
@@ -589,6 +698,7 @@ def predict_itransformer_with_saved_model(
         device="cuda" if use_gpu and torch.cuda.is_available() else "cpu",
         rows_used=rows_used,
         metrics=metrics,
+        val_metrics=_best_val_metrics_from_history(hist_df),
         model_path=ckpt_path,
         metrics_path=metrics_path,
         future_path=future_path,
@@ -604,39 +714,40 @@ def predict_itransformer_with_saved_model(
 
 def _main() -> None:
     parser = argparse.ArgumentParser(description="Train iTransformer AQI with shared project layout.")
-    parser.add_argument("--data-path", default="dataset/air_quality.csv")
-    parser.add_argument("--target-col", default="aqi")
+    parser.add_argument("--data-path", required=True)
+    parser.add_argument("--target-col", required=True)
     parser.add_argument("--locations", default="")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--window-size", type=int, default=72)
-    parser.add_argument("--horizon", type=int, default=12)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--loss", default="huber", choices=["huber", "mse"])
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
-    parser.add_argument("--d-model", type=int, default=128)
-    parser.add_argument("--n-layers", type=int, default=3, help="Encoder layers/e_layers.")
-    parser.add_argument("--label-len", type=int, default=48)
-    parser.add_argument("--n-heads", type=int, default=8)
-    parser.add_argument("--d-layers", type=int, default=1)
-    parser.add_argument("--d-ff", type=int, default=128)
-    parser.add_argument("--factor", type=int, default=1)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--embed", default="timeF")
-    parser.add_argument("--activation", default="gelu")
-    parser.add_argument("--des", default="Exp")
-    parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--features", default="MS", choices=["M", "S", "MS"])
-    parser.add_argument("--model-id", default="air_quality_AQI")
-    parser.add_argument("--model", default="Transformer")
-    parser.add_argument("--freq", default="h")
-    parser.add_argument("--enc-in", type=int, default=11)
-    parser.add_argument("--dec-in", type=int, default=11)
-    parser.add_argument("--c-out", type=int, default=1)
-    parser.add_argument("--use-amp", action="store_true")
-    parser.add_argument("--no-inverse", action="store_true")
-    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--epochs", type=int, required=True)
+    parser.add_argument("--window-size", type=int, required=True)
+    parser.add_argument("--horizon", type=int, required=True)
+    parser.add_argument("--batch-size", type=int, required=True)
+    parser.add_argument("--lr", type=float, required=True)
+    parser.add_argument("--loss", required=True, choices=["huber", "mse"])
+    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--num-workers", type=int, required=True)
+    parser.add_argument("--device", required=True, choices=["cuda", "cpu"])
+    parser.add_argument("--d-model", type=int, required=True)
+    parser.add_argument("--n-layers", type=int, required=True, help="Encoder layers/e_layers.")
+    parser.add_argument("--label-len", type=int, required=True)
+    parser.add_argument("--n-heads", type=int, required=True)
+    parser.add_argument("--d-layers", type=int, required=True)
+    parser.add_argument("--d-ff", type=int, required=True)
+    parser.add_argument("--factor", type=int, required=True)
+    parser.add_argument("--dropout", type=float, required=True)
+    parser.add_argument("--embed", required=True)
+    parser.add_argument("--activation", required=True)
+    parser.add_argument("--des", required=True)
+    parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--features", required=True, choices=["M", "S", "MS"])
+    parser.add_argument("--model-id", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--freq", required=True)
+    parser.add_argument("--enc-in", type=int, required=True)
+    parser.add_argument("--dec-in", type=int, required=True)
+    parser.add_argument("--c-out", type=int, required=True)
+    parser.add_argument("--use-amp", type=_str_to_bool, required=True)
+    parser.add_argument("--inverse", type=_str_to_bool, required=True)
+    parser.add_argument("--patience", type=int, required=True)
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args()
 
@@ -662,7 +773,7 @@ def _main() -> None:
         seed=args.seed,
         use_gpu=args.device == "cuda",
         early_stop_patience=args.patience,
-        run_dir=args.out_dir,
+        num_workers=args.num_workers,
         label_len=args.label_len,
         n_heads=args.n_heads,
         d_layers=args.d_layers,
@@ -681,7 +792,8 @@ def _main() -> None:
         dec_in=args.dec_in,
         c_out=args.c_out,
         use_amp=args.use_amp,
-        inverse=not args.no_inverse,
+        inverse=args.inverse,
+        run_dir=args.out_dir,
     )
     print("iTransformer complete.")
     print(f"Model  : {summary['model_path']}")

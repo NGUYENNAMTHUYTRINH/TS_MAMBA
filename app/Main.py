@@ -20,11 +20,10 @@ for path in [str(APP_DIR), str(PROJECT_ROOT)]:
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from Pipeline_mamba import predict_with_saved_model, train_pipeline
-from Pipeline_lstm import predict_lstm_with_saved_model, train_lstm_pipeline
+from Pipeline_mamba import predict_with_saved_model
+from Pipeline_lstm import predict_lstm_with_saved_model
 from Pipeline_itransformer import (
     predict_itransformer_with_saved_model,
-    train_itransformer_pipeline,
 )
 from Ui_components import (
     render_data_preview,
@@ -32,9 +31,30 @@ from Ui_components import (
     render_location_selector,
     render_model_results,
     render_sidebar,
-    render_train_config,
 )
 from Utils import model_run_dir
+
+
+def _default_predict_config(df: pd.DataFrame) -> dict:
+    blocked_lower = {"ts_utc", "time", "timestamp", "location_key"}
+    feature_cols = [
+        c
+        for c in df.columns
+        if c.lower() not in blocked_lower
+        and not c.lower().startswith("unnamed:")
+        and c not in {"y_true", "y_pred", "abs_error"}
+    ]
+    target_col = "aqi" if "aqi" in feature_cols else (feature_cols[0] if feature_cols else "aqi")
+    return {
+        "target_col": target_col,
+        "feature_cols": feature_cols,
+        "loss_name": "huber",
+        "window_size": 72,
+        "horizon": 12,
+        "sample_stride": 4,
+        "batch_size": 128,
+        "use_gpu": True,
+    }
 
 
 def _selected_feature_cols(train_cfg: dict) -> list[str]:
@@ -85,8 +105,6 @@ def _default_checkpoint_path(project_root: Path, model_type: str) -> str:
 def _models_to_run(model_type: str) -> list[str]:
     if model_type == "Tat ca":
         return ["Mamba", "LSTM", "iTransformer"]
-    if "+" in model_type:
-        return [part.strip() for part in model_type.split("+")]
     return [model_type]
 
 
@@ -95,8 +113,8 @@ def _render_comparison(results: list[tuple[str, dict, object, object]]) -> None:
     for name, summary, _, _ in results:
         rows.append({
             "model": name,
-            "test_mae": summary.get("test_mae"),
-            "test_rmse": summary.get("test_rmse"),
+            "test_mae_norm": summary.get("test_mae_norm"),
+            "test_rmse_norm": summary.get("test_rmse_norm"),
             "test_r2": summary.get("test_r2"),
             "val_mae_norm": summary.get("val_mae_norm"),
             "val_rmse_norm": summary.get("val_rmse_norm"),
@@ -124,19 +142,19 @@ def _render_best_model(results: list[tuple[str, dict, object, object]]) -> None:
     best = min(
         results,
         key=lambda item: (
-            _metric_value(item[1], "test_rmse", float("inf")),
+            _metric_value(item[1], "test_rmse_norm", float("inf")),
             -_metric_value(item[1], "test_r2", float("-inf")),
-            _metric_value(item[1], "test_mae", float("inf")),
+            _metric_value(item[1], "test_mae_norm", float("inf")),
         ),
     )
     name, summary, _, _ = best
 
     st.write("### Model tot nhat")
-    st.success(f"{name} dang tot nhat theo Test RMSE thap nhat.")
+    st.success(f"{name} dang tot nhat theo Test RMSE Norm thap nhat.")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Best model", name)
-    c2.metric("Test RMSE", f"{_metric_value(summary, 'test_rmse', float('nan')):.4f}")
-    c3.metric("Test MAE", f"{_metric_value(summary, 'test_mae', float('nan')):.4f}")
+    c2.metric("Test RMSE Norm", f"{_metric_value(summary, 'test_rmse_norm', float('nan')):.4f}")
+    c3.metric("Test MAE Norm", f"{_metric_value(summary, 'test_mae_norm', float('nan')):.4f}")
     c4.metric("Test R2", f"{_metric_value(summary, 'test_r2', float('nan')):.4f}")
 
 
@@ -189,85 +207,10 @@ def _predict_model(
     )
 
 
-def _train_model(
-    name: str,
-    df,
-    selected_locations: list[str],
-    train_cfg: dict,
-    feature_cols: list[str],
-    project_root: Path,
-    timestamp: str,
-):
-    if name == "LSTM":
-        return train_lstm_pipeline(
-            df=df,
-            selected_locations=selected_locations,
-            target_col=train_cfg["target_col"],
-            feature_cols=feature_cols,
-            window_size=train_cfg["window_size"],
-            horizon=train_cfg["horizon"],
-            epochs=train_cfg["epochs"],
-            batch_size=train_cfg["batch_size"],
-            lr=train_cfg["lr"],
-            hidden_size=train_cfg["d_model"],
-            num_layers=train_cfg["n_layers"],
-            loss_name=train_cfg["loss_name"],
-            seed=train_cfg["seed"],
-            use_gpu=train_cfg["use_gpu"],
-            early_stop_patience=train_cfg["early_stop_patience"],
-            run_dir=model_run_dir(project_root, "lstm", timestamp),
-        )
-    if name == "iTransformer":
-        return train_itransformer_pipeline(
-            df=df,
-            selected_locations=selected_locations,
-            target_col=train_cfg["target_col"],
-            feature_cols=feature_cols,
-            window_size=train_cfg["window_size"],
-            horizon=train_cfg["horizon"],
-            epochs=train_cfg["epochs"],
-            batch_size=train_cfg["batch_size"],
-            lr=train_cfg["lr"],
-            d_model=train_cfg["d_model"],
-            n_layers=train_cfg["n_layers"],
-            loss_name=train_cfg["loss_name"],
-            seed=train_cfg["seed"],
-            use_gpu=train_cfg["use_gpu"],
-            early_stop_patience=train_cfg["early_stop_patience"],
-            run_dir=model_run_dir(project_root, "itransformer", timestamp),
-        )
-    return train_pipeline(
-        df=df,
-        forecast_base_df=None,
-        selected_locations=selected_locations,
-        target_col=train_cfg["target_col"],
-        feature_cols=feature_cols,
-        window_size=train_cfg["window_size"],
-        horizon=train_cfg["horizon"],
-        sample_stride=train_cfg["sample_stride"],
-        epochs=train_cfg["epochs"],
-        batch_size=train_cfg["batch_size"],
-        lr=train_cfg["lr"],
-        weight_decay=train_cfg["weight_decay"],
-        d_model=train_cfg["d_model"],
-        n_layers=train_cfg["n_layers"],
-        loss_name=train_cfg["loss_name"],
-        seed=train_cfg["seed"],
-        num_workers=4,
-        use_gpu=train_cfg["use_gpu"],
-        log_interval=50,
-        grad_accum_steps=train_cfg["grad_accum_steps"],
-        max_grad_norm=train_cfg["max_grad_norm"],
-        early_stop_patience=train_cfg["early_stop_patience"],
-        early_stop_min_delta=0.0,
-        run_dir=model_run_dir(project_root, "mamba", timestamp),
-    )
-
-
 def main() -> None:
     st.set_page_config(page_title="AQI Mamba", layout="wide")
-    st.title("AQI Forecasting: Mamba")
-    st.caption("Du doan tren Streamlit bang checkpoint da train, hoac train lai model khi can.")
+    st.title("AQI Forecasting")
+    st.caption("Du doan tren Streamlit bang checkpoint da train.")
 
     render_sidebar()
 
@@ -277,7 +220,7 @@ def main() -> None:
 
     df = st.session_state["df"]
     selected_locations = render_location_selector(df)
-    train_cfg = render_train_config()
+    train_cfg = _default_predict_config(df)
     render_data_preview(df)
 
     results: list[tuple[str, dict, object, object]] = []
@@ -288,7 +231,7 @@ def main() -> None:
     st.subheader("Model")
     model_type = st.selectbox(
         "Loai model",
-        ["Mamba", "LSTM", "iTransformer", "Mamba + LSTM", "Tat ca"],
+        ["Tat ca", "Mamba", "LSTM", "iTransformer"],
         index=0,
     )
     checkpoint_paths: dict[str, str] = {}
@@ -311,13 +254,9 @@ def main() -> None:
             help="Streamlit se load checkpoint va chay inference moi, khong doc file future_*.csv co san.",
         )
 
-    action_col1, action_col2 = st.columns(2)
-    with action_col1:
-        predict_clicked = st.button("Du doan bang checkpoint", use_container_width=True, type="primary")
-    with action_col2:
-        train_clicked = st.button("Train lai model", use_container_width=True)
+    predict_clicked = st.button("Du doan bang checkpoint", use_container_width=True, type="primary")
 
-    if predict_clicked or train_clicked:
+    if predict_clicked:
         if not selected_locations:
             st.warning("Vui long chon it nhat mot dia diem.")
             st.stop()
@@ -330,38 +269,21 @@ def main() -> None:
         status_placeholder = st.empty()
 
         try:
-            if predict_clicked:
-                status_placeholder.info("Dang load checkpoint va chay inference moi tren Streamlit...")
-                models_to_run = _models_to_run(model_type)
-                for name in models_to_run:
-                    summary, hist_df, future_df = _predict_model(
-                        name,
-                        df,
-                        selected_locations,
-                        train_cfg,
-                        feature_cols,
-                        checkpoint_paths,
-                        project_root,
-                        timestamp,
-                    )
-                    results.append((name, summary, hist_df, future_df))
-                status_placeholder.success("Da du doan xong bang checkpoint.")
-
-            else:
-                status_placeholder.info(f"Dang huan luyen {model_type}...")
-                models_to_run = _models_to_run(model_type)
-                for name in models_to_run:
-                    summary, hist_df, future_df = _train_model(
-                        name,
-                        df,
-                        selected_locations,
-                        train_cfg,
-                        feature_cols,
-                        project_root,
-                        timestamp,
-                    )
-                    results.append((name, summary, hist_df, future_df))
-                status_placeholder.success(f"Hoan thanh huan luyen {model_type}.")
+            status_placeholder.info("Dang load checkpoint va chay inference moi tren Streamlit...")
+            models_to_run = _models_to_run(model_type)
+            for name in models_to_run:
+                summary, hist_df, future_df = _predict_model(
+                    name,
+                    df,
+                    selected_locations,
+                    train_cfg,
+                    feature_cols,
+                    checkpoint_paths,
+                    project_root,
+                    timestamp,
+                )
+                results.append((name, summary, hist_df, future_df))
+            status_placeholder.success("Da du doan xong bang checkpoint.")
 
         except Exception as e:
             st.error(f"Loi pipeline: {e}")
